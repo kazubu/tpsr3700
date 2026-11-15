@@ -86,6 +86,7 @@ tpsr3700 [OPTIONS] <TEXT>
 | `--line-ratios <R,R>` | — | Per-line font size ratios for multi-line text (e.g. `7,3`). The count must equal the number of lines. See [Multi-line rules](#multi-line-rules). |
 | `--frame` | off | Draw a rectangular frame around the printed content, hugging the ink with ~1mm of padding. Composes with multi-line text, `--line-ratios`, `--align` and wrapping, and appears in previews. |
 | `--frame-width <DOTS>` | `2` | Frame line thickness in dots (1-3). Only with `--frame`. |
+| `--frame-mm <MM>` | hug the text | Frame width in mm along the label (the feed direction), centred on the label, so labels of the same length get an identical box however long their text is. Clamped to the label. Only with `--frame`. |
 | `--vid <HEX>` / `--pid <HEX>` | `0d8a` / `0103` | USB vendor/product ID override, in hex. Default to `TEPRA_USB_VID` / `TEPRA_USB_PID`, else the SR3700P's IDs. Find them with `lsusb`. |
 | `--send-header` | off | Also send the 2179-byte header block. The Windows driver does not, and sending it makes the printer stall ~20s before printing. Experiments only. |
 | `--no-soft-reset` | off | Skip the printer-class SOFT_RESET normally issued right before the job. Experiments only. |
@@ -292,6 +293,7 @@ tpsr3700 [オプション] <テキスト>
 | `--line-ratios <R,R>` | — | 複数行テキストの行ごとの文字サイズ比率（例: `7,3`）。個数は行数と一致する必要がある。[複数行印刷のルール](#複数行印刷のルール)を参照。 |
 | `--frame` | 無効 | 印字内容の周囲に枠線を描く（インクの外周に約 1mm の余白を取る）。複数行・`--line-ratios`・`--align`・折り返しと併用でき、プレビューにも出る。 |
 | `--frame-width <DOTS>` | `2` | 枠線の太さ（ドット、1〜3）。`--frame` と併用。 |
+| `--frame-mm <MM>` | 文字を囲む | 枠線の横幅（mm、送り方向）。ラベルの中央にその幅で描くので、同じ長さのラベルなら文字の長さに関わらず同じ大きさの枠になる。ラベル長を超える指定は切り詰める。`--frame` と併用。 |
 | `--vid <HEX>` / `--pid <HEX>` | `0d8a` / `0103` | USB の vendor/product ID を 16 進で上書きする。未指定なら `TEPRA_USB_VID` / `TEPRA_USB_PID`、それも無ければ SR3700P の値。`lsusb` で確認する。 |
 | `--send-header` | 無効 | 2179 バイトのヘッダブロックも送る。公式ドライバは送らず、送ると印刷開始が 20 秒ほど遅れる。実験用。 |
 | `--no-soft-reset` | 無効 | ジョブ直前に送るプリンタクラスの SOFT_RESET を省く。実験用。 |

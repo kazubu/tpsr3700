@@ -294,7 +294,8 @@ struct Args {
     /// `font::apply_frame`), so it composes with multi-line text,
     /// --line-ratios, --align and wrap mode, and appears identically in
     /// previews. The frame hugs the ink bounding box with ~1mm of
-    /// padding, clamped to the printable band.
+    /// padding, clamped to the printable band; --frame-mm sets its
+    /// width along the label instead.
     #[arg(long)]
     frame: bool,
 
@@ -302,6 +303,15 @@ struct Args {
     /// with --frame.
     #[arg(long, default_value_t = 2)]
     frame_width: usize,
+
+    /// Width of the frame in millimetres along the feed direction (the
+    /// label's horizontal direction). Without it the frame hugs the
+    /// text with about 1mm of padding; with it the frame is that wide
+    /// and centred on the label, so labels of the same length get an
+    /// identical box however long their text is. Clamped to the label's
+    /// length. Only with --frame.
+    #[arg(long, requires = "frame")]
+    frame_mm: Option<f32>,
 
     /// Write the generated raw TEPRA job bytes to this file instead of (or
     /// in addition to) sending it to the printer. Useful for debugging
@@ -882,12 +892,18 @@ fn render_label(
     // frame appears in the print job and in every preview path.
     let mut rows = rows;
     if args.frame {
-        tpsr3700::font::apply_frame(
+        let frame_rows = match args.frame_mm {
+            Some(mm) if mm > 0.0 => Some(tape.mm_to_rows(mm) as usize),
+            Some(mm) => anyhow::bail!("--frame-mm must be a positive number, got {mm}"),
+            None => None,
+        };
+        tpsr3700::font::apply_frame_sized(
             &mut rows,
             tape.bitmap_bits(),
             top_margin,
             bottom_margin,
             args.frame_width,
+            frame_rows,
         );
     }
     Ok((rows, margin))

@@ -1058,6 +1058,27 @@ pub fn apply_frame(
     bottom_margin_bits: usize,
     thickness: usize,
 ) {
+    apply_frame_sized(rows, total_bits, top_margin_bits, bottom_margin_bits, thickness, None)
+}
+
+/// Like [`apply_frame`], but with an explicit frame width in the feed
+/// direction (the label's horizontal direction as it comes out of the
+/// printer), given in rows.
+///
+/// `width_rows` of `None` keeps the default behaviour of hugging the
+/// ink. With `Some(w)` the frame is `w` rows wide and centred on the
+/// label rather than on the ink, so labels of the same length get an
+/// identical box wherever their text happens to sit; `w` is clamped to
+/// the label's length. The extent across the tape still comes from the
+/// ink, as before.
+pub fn apply_frame_sized(
+    rows: &mut [Vec<u8>],
+    total_bits: usize,
+    top_margin_bits: usize,
+    bottom_margin_bits: usize,
+    thickness: usize,
+    width_rows: Option<usize>,
+) {
     let thickness = thickness.clamp(1, 3);
     if rows.is_empty() || total_bits == 0 {
         return;
@@ -1082,8 +1103,18 @@ pub fn apply_frame(
     let Some(first_row) = first_row else {
         return; // no ink: nothing to frame
     };
-    let row_lo = first_row.saturating_sub(FRAME_PAD_DOTS);
-    let row_hi = (last_row + FRAME_PAD_DOTS).min(rows.len() - 1);
+    let (row_lo, row_hi) = match width_rows {
+        Some(w) if w > 0 => {
+            let w = w.min(rows.len());
+            // Centre the box on the label, not on the ink.
+            let lo = (rows.len() / 2).saturating_sub(w / 2).min(rows.len() - w);
+            (lo, lo + w - 1)
+        }
+        _ => (
+            first_row.saturating_sub(FRAME_PAD_DOTS),
+            (last_row + FRAME_PAD_DOTS).min(rows.len() - 1),
+        ),
+    };
     let band_lo = bottom_margin_bits.min(total_bits - 1);
     let band_hi = total_bits.saturating_sub(top_margin_bits).saturating_sub(1).max(band_lo);
     let bit_lo = min_bit.saturating_sub(FRAME_PAD_DOTS).max(band_lo);
@@ -2495,6 +2526,38 @@ mod tests {
         // The narrower IP line no longer drags the label length.
         assert!(rows_73.len() < rows_eq.len(),
             "7:3 label ({} rows) should be shorter than 1:1 ({} rows)", rows_73.len(), rows_eq.len());
+    }
+
+    #[test]
+    fn explicit_frame_width_is_centred_on_the_label() {
+        // 40 rows x 32 bits, ink off to one side of the label.
+        let bits = 32usize;
+        let mut rows = vec![vec![0u8; bits / 8]; 40];
+        set_row_bit(&mut rows[6], 16);
+        apply_frame_sized(&mut rows, bits, 2, 2, 1, Some(20));
+        // 20 rows wide, centred on the label: rows 10..=29, wherever the
+        // ink sits. The ends are the only fully inked rows.
+        for (r, want) in [(9usize, false), (10, true), (29, true), (30, false)] {
+            let full = (8..=24).all(|bit| row_bit_is_set(&rows[r], bit));
+            assert_eq!(full, want, "row {r} fully inked = {full}, expected {want}");
+        }
+        // Without a width the same label hugs the ink instead.
+        let mut hugged = vec![vec![0u8; bits / 8]; 40];
+        set_row_bit(&mut hugged[6], 16);
+        apply_frame_sized(&mut hugged, bits, 2, 2, 1, None);
+        assert!((8..=24).all(|bit| row_bit_is_set(&hugged[0], bit)), "hugging frame starts at the ink");
+        assert!(!(8..=24).all(|bit| row_bit_is_set(&hugged[29], bit)), "hugging frame is shorter");
+    }
+
+    #[test]
+    fn explicit_frame_width_is_clamped_to_the_label() {
+        let bits = 32usize;
+        let mut rows = vec![vec![0u8; bits / 8]; 12];
+        set_row_bit(&mut rows[6], 16);
+        apply_frame_sized(&mut rows, bits, 2, 2, 1, Some(999));
+        for r in [0usize, 11] {
+            assert!((8..=24).all(|bit| row_bit_is_set(&rows[r], bit)), "row {r} is an edge of the clamped frame");
+        }
     }
 
     #[test]
