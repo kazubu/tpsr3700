@@ -223,6 +223,16 @@ rather than just logging:
    dropped job is indistinguishable from a finished one, and the CLI
    exits 0 having printed nothing.
 
+Measured on an SR750 printing three 9mm labels as one half-cut job
+(2026-11-15): the whole 11812-byte payload was accepted in 0.02 s, so
+the printer buffers at least that much; the activity byte went to `02`
+after 0.2 s, to `05` at 15.3 s and back to `00` at 15.8 s. That is
+roughly 5 s per label, which is where the wait timeout of
+`180 + 30 x labels` seconds comes from, and why a job much larger than
+the printer's buffer (100 labels is 838 KB at 9mm, 3.5 MB at 24mm)
+cannot be written in one transfer: the write would have to block for
+the entire print.
+
 Consequences for this implementation:
 
 - `send_job` is given [`printer_payload`](../src/tepra/builder.rs) of the
