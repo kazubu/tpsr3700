@@ -72,7 +72,11 @@ pub fn show_preview(
     }
 }
 
-fn build_svg_preview(
+/// Builds the SVG preview string for `rows` without writing a file,
+/// opening a viewer, or prompting. Used by the `--preview-out` CLI mode
+/// (and by the Web frontend) so the exact same rendering that
+/// [`show_preview`] displays can be saved or served over HTTP.
+pub fn build_svg_preview(
     rows: &[Vec<u8>],
     tape: TapeWidth,
     label_text: &str,

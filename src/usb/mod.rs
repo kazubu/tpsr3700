@@ -34,19 +34,60 @@ pub const VENDOR_ID: u16 = 0x0d8a;
 /// Confirmed via `lsusb`: `ID 0d8a:0103 King Jim Co., Ltd SR3700P`.
 pub const PRODUCT_ID: u16 = 0x0103;
 
-/// Finds the TEPRA SR3700P on the USB bus.
+/// Parses a USB ID given as a CLI/env string. USB IDs are written in
+/// hex by `lsusb` and everywhere else, so both `0x`-prefixed and bare
+/// values are interpreted as hexadecimal (e.g. "0103" means 0x0103).
+pub fn parse_usb_id(s: &str) -> Result<u16> {
+    let s = s.trim();
+    let hex = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
+    u16::from_str_radix(hex, 16)
+        .map_err(|e| anyhow::anyhow!("invalid hex USB ID '{s}': {e}"))
+}
+
+fn env_usb_id(name: &str, default: u16) -> u16 {
+    match std::env::var(name) {
+        Ok(v) => parse_usb_id(&v).unwrap_or(default),
+        Err(_) => default,
+    }
+}
+
+/// Effective vendor ID: `TEPRA_USB_VID` env var, else [`VENDOR_ID`].
+///
+/// This fork makes the IDs overridable so other TEPRA PRO models (e.g.
+/// the SR3900P, whose USB product ID is not yet confirmed) can be
+/// targeted without recompiling: run `lsusb` with the printer attached,
+/// find the `0d8a:xxxx` entry, and pass the product part via `--pid` /
+/// `TEPRA_USB_PID`.
+pub fn vendor_id() -> u16 {
+    env_usb_id("TEPRA_USB_VID", VENDOR_ID)
+}
+
+/// Effective product ID: `TEPRA_USB_PID` env var, else [`PRODUCT_ID`].
+pub fn product_id() -> u16 {
+    env_usb_id("TEPRA_USB_PID", PRODUCT_ID)
+}
+
+/// Finds the TEPRA printer on the USB bus using the effective
+/// (env-overridable) vendor/product IDs.
 pub fn find_device() -> Result<Device<GlobalContext>> {
+    find_device_with(vendor_id(), product_id())
+}
+
+/// Finds a USB device with the given vendor/product IDs.
+pub fn find_device_with(vid: u16, pid: u16) -> Result<Device<GlobalContext>> {
     for device in rusb::devices()?.iter() {
         let desc = device.device_descriptor()?;
-        if desc.vendor_id() == VENDOR_ID && desc.product_id() == PRODUCT_ID {
+        if desc.vendor_id() == vid && desc.product_id() == pid {
             return Ok(device);
         }
     }
     bail!(
-        "TEPRA SR3700P not found (looking for vendor={:#06x} product={:#06x}); \
-         run `lsusb` to find the correct IDs and update usb::VENDOR_ID / PRODUCT_ID",
-        VENDOR_ID,
-        PRODUCT_ID
+        "TEPRA printer not found (looking for vendor={vid:#06x} product={pid:#06x}); \
+         run `lsusb` to find the correct IDs and pass them via --pid / TEPRA_USB_PID \
+         (defaults are the SR3700P's 0d8a:0103)"
     );
 }
 
@@ -59,9 +100,15 @@ pub struct Printer {
 }
 
 impl Printer {
-    /// Open the printer and claim its Printer-class interface.
+    /// Open the printer and claim its Printer-class interface, using
+    /// the effective (env-overridable) vendor/product IDs.
     pub fn open() -> Result<Self> {
-        let device = find_device()?;
+        Self::open_with(vendor_id(), product_id())
+    }
+
+    /// Open the printer with explicit USB vendor/product IDs.
+    pub fn open_with(vid: u16, pid: u16) -> Result<Self> {
+        let device = find_device_with(vid, pid)?;
         let config = device.active_config_descriptor()?;
         let interface = config
             .interfaces()
@@ -89,14 +136,14 @@ impl Printer {
         let endpoint_out = endpoint_out.context("no bulk OUT endpoint found")?;
         let endpoint_in = endpoint_in.context("no bulk IN endpoint found")?;
 
-        let handle = device.open().context(
+        let handle = device.open().with_context(|| format!(
             "failed to open the printer's USB device (permission denied?)\n\n\
              This usually means your user doesn't have read/write permission to\n\
              access the printer's USB device node. Try one of:\n\
              \n\
              1. Create a udev rule (recommended — survives reboots):\n\
              \n\
-             \x20   echo 'SUBSYSTEM==\"usb\", ATTRS{idVendor}==\"0d8a\", ATTRS{idProduct}==\"0103\", GROUP=\"lp\", MODE=\"0660\"' \\\n\
+             \x20   echo 'SUBSYSTEM==\"usb\", ATTRS{{idVendor}}==\"{vid:04x}\", ATTRS{{idProduct}}==\"{pid:04x}\", GROUP=\"lp\", MODE=\"0660\"' \\\n\
              \x20       | sudo tee /etc/udev/rules.d/99-tepra.rules\n\
              \x20   sudo usermod -aG lp $USER\n\
              \x20   sudo udevadm control --reload && sudo udevadm trigger\n\
@@ -116,8 +163,7 @@ impl Printer {
              \n\
              4. Or, run as root (not recommended for routine use):\n\
              \n\
-             \x20   sudo <the command you just ran>",
-        )?;
+             \x20   sudo <the command you just ran>"))?;
 
         // On Linux the printer's interface is normally bound to the
         // kernel's `usblp` driver (it advertises USB Printer class 7/1/2),

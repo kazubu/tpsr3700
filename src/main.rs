@@ -93,7 +93,42 @@ fn dump_explain(job: &[u8], tape: TapeWidth, top_margin: usize, bottom_margin: u
 #[command(version, about)]
 struct Args {
     /// Text to print.
-    text: String,
+    text: Option<String>,
+
+    /// USB vendor ID override (hex, e.g. 0d8a). Defaults to the
+    /// TEPRA_USB_VID env var, or the SR3700P's 0d8a. Useful for other
+    /// TEPRA PRO models such as the SR3900P: find the IDs with `lsusb`
+    /// while the printer is attached.
+    #[arg(long)]
+    vid: Option<String>,
+
+    /// USB product ID override (hex, e.g. 0103). Defaults to the
+    /// TEPRA_USB_PID env var, or the SR3700P's 0103.
+    #[arg(long)]
+    pid: Option<String>,
+
+    /// Write an SVG preview of the job to this path and exit without
+    /// printing and without prompting. The SVG is rendered from the
+    /// exact raster rows that would be sent to the printer (same code
+    /// path as the interactive preview). Intended for Web frontends.
+    #[arg(long)]
+    preview_out: Option<PathBuf>,
+
+    /// Query the printer for the currently loaded tape width, print the
+    /// result as one line of JSON on stdout, and exit. No TEXT argument
+    /// is needed in this mode and nothing is printed.
+    ///
+    /// Output: {"tape_mm": 18, "index": 4, "supported": true}
+    /// `index` is the raw tape width index reported by the printer
+    /// (see docs/protocol.md section 1.5). `supported` is false when the
+    /// loaded width isn't supported by this driver (e.g. 9mm/36mm); in
+    /// that case `tape_mm` is the nominal width for the index, or null
+    /// if the index itself is unknown. If no printer is found, an error
+    /// naming the vendor/product IDs that were searched for is printed
+    /// to stderr and the exit status is non-zero.
+    #[arg(long)]
+    detect_tape: bool,
+
 
     /// Tape width in millimeters (6, 12, 18, and experimental 24 are supported).
     /// If omitted, the width is auto-detected by querying the printer
@@ -107,6 +142,23 @@ struct Args {
     /// line-band when multi-line wrapping is active) is used automatically.
     #[arg(long)]
     size: Option<f32>,
+
+    /// Per-line font size ratios for newline-separated multi-line text,
+    /// comma-separated (e.g. "7,3" makes the first line 7/3 the size of
+    /// the second). The number of ratios must equal the number of lines;
+    /// a mismatch is an error. Each line's band of the tape width is
+    /// also divided proportionally to the ratios.
+    ///
+    /// Size semantics: with --size S, S is the size of the largest-ratio
+    /// line and line i is S * ratio_i / max(ratios). Without --size,
+    /// line i is max_size * ratio_i / sum(ratios), so each line fills
+    /// its proportional band (equal ratios = the traditional
+    /// max/lines in equal bands).
+    ///
+    /// Cannot be combined with --max-tape-length-mm (wrap mode): ratios
+    /// apply only to explicit '\n'-separated lines.
+    #[arg(long)]
+    line_ratios: Option<String>,
 
     /// Blank tape feed margin (in millimeters) added before the printed
     /// content (left side when the label exits the printer).
@@ -146,6 +198,20 @@ struct Args {
     #[arg(long)]
     font: Option<String>,
 
+    /// Draw a rectangular frame around the printed content. The frame
+    /// is applied to the rendered raster rows (see
+    /// `font::apply_frame`), so it composes with multi-line text,
+    /// --line-ratios, --align and wrap mode, and appears identically in
+    /// previews. The frame hugs the ink bounding box with ~1mm of
+    /// padding, clamped to the printable band.
+    #[arg(long)]
+    frame: bool,
+
+    /// Frame line thickness in dots (1-3). Only meaningful together
+    /// with --frame.
+    #[arg(long, default_value_t = 2)]
+    frame_width: usize,
+
     /// Write the generated raw TEPRA job bytes to this file instead of (or
     /// in addition to) sending it to the printer. Useful for debugging
     /// without hardware.
@@ -165,19 +231,113 @@ struct Args {
     skip_preview: bool,
 }
 
+/// Opens the printer, resolving `--vid`/`--pid` overrides (which fall
+/// back to the `TEPRA_USB_VID`/`TEPRA_USB_PID` env vars, then to the
+/// SR3700P defaults) the same way for every mode.
+fn open_printer(args: &Args) -> Result<tpsr3700::usb::Printer> {
+    match (&args.vid, &args.pid) {
+        (None, None) => tpsr3700::usb::Printer::open(),
+        _ => {
+            let vid = match &args.vid {
+                Some(s) => tpsr3700::usb::parse_usb_id(s)?,
+                None => tpsr3700::usb::vendor_id(),
+            };
+            let pid = match &args.pid {
+                Some(s) => tpsr3700::usb::parse_usb_id(s)?,
+                None => tpsr3700::usb::product_id(),
+            };
+            tpsr3700::usb::Printer::open_with(vid, pid)
+        }
+    }
+}
+
+/// Nominal tape width in mm for a detected tape width index, per the
+/// index mapping in docs/protocol.md section 1.5
+/// (`[4, 6, 9, 12, 18, 24, 36, 50]` mm for indices 0..=7). Returns
+/// `None` for indices outside that table. This exists so widths the
+/// driver cannot print to yet (9mm, 36mm, ...) can still be reported
+/// by name in `--detect-tape` output.
+fn nominal_mm_for_detected_index(index: u8) -> Option<u8> {
+    match index {
+        0 => Some(4),
+        1 => Some(6),
+        2 => Some(9),
+        3 => Some(12),
+        4 => Some(18),
+        5 => Some(24),
+        6 => Some(36),
+        7 => Some(50),
+        _ => None,
+    }
+}
+
+/// Formats the `--detect-tape` result as one line of JSON:
+/// `{"tape_mm": 18, "index": 4, "supported": true}`. For unsupported
+/// widths `tape_mm` falls back to the nominal width for the index
+/// (or `null` when the index is unknown).
+fn detect_tape_json(detected: Option<TapeWidth>, index: u8) -> String {
+    let supported = detected.is_some();
+    let tape_mm = detected
+        .map(|t| t.width_mm())
+        .or_else(|| nominal_mm_for_detected_index(index));
+    let tape_mm_json = tape_mm
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    format!("{{\"tape_mm\": {tape_mm_json}, \"index\": {index}, \"supported\": {supported}}}")
+}
+
+/// Parse a `--line-ratios` value such as "7,3" into positive floats.
+fn parse_line_ratios(s: &str) -> Result<Vec<f32>> {
+    let mut out = Vec::new();
+    for part in s.split(',') {
+        let part = part.trim();
+        let v: f32 = part
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid line ratio '{part}': not a number"))?;
+        if !v.is_finite() || v <= 0.0 {
+            anyhow::bail!("line ratios must be positive numbers, got '{part}'");
+        }
+        out.push(v);
+    }
+    if out.is_empty() {
+        anyhow::bail!("--line-ratios must not be empty");
+    }
+    Ok(out)
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    // --preview-out never prints, so it behaves like --no-print for the
+    // purpose of opening the printer.
+    let no_print = args.no_print || args.preview_out.is_some();
 
     // Replace literal "\n" (two characters: backslash + n) with a real
     // newline, so the user can write --  "line1\nline2" on the command line
     // without needing shell $'...' quoting.
-    let text = args.text.replace("\\n", "\n");
+    // --detect-tape: query the loaded tape width, print it as JSON on
+    // stdout, and exit. TEXT is neither required nor used in this mode.
+    if args.detect_tape {
+        let printer = open_printer(&args)?;
+        let (detected, index) = printer.get_tape_width_with_index()?;
+        println!("{}", detect_tape_json(detected, index));
+        return Ok(());
+    }
+
+    let text = args
+        .text
+        .clone()
+        .map(|t| t.replace("\\n", "\n"))
+        .unwrap_or_default();
+    if args.text.is_none() {
+        anyhow::bail!("nothing to print: pass TEXT");
+    }
 
     // Open the printer early if we might need it, either for tape width
     // auto-detection or for actually sending the job, so both can share
     // the same connection.
-    let mut printer = if !args.no_print || args.tape_mm.is_none() {
-        Some(tpsr3700::usb::Printer::open()?)
+    let mut printer = if !no_print || args.tape_mm.is_none() {
+        Some(open_printer(&args)?)
     } else {
         None
     };
@@ -216,7 +376,42 @@ fn main() -> Result<()> {
             .map_err(|e| anyhow::anyhow!("bundled font failed to load: {e}"))?,
     };
 
-    let (rows, margin) = if let Some(tape_length_mm) = args.max_tape_length_mm {
+    let line_ratios = match &args.line_ratios {
+        Some(s) => Some(parse_line_ratios(s)?),
+        None => None,
+    };
+    if line_ratios.is_some() && args.max_tape_length_mm.is_some() {
+        anyhow::bail!(
+            "--line-ratios cannot be combined with --max-tape-length-mm (wrap mode); \
+             ratios apply only to explicit newline-separated lines"
+        );
+    }
+
+    let (rows, margin) = if let Some(ratios) = &line_ratios {
+        // With ratios, --size (when given) is the largest-ratio line's
+        // size, so the existing would_clip warning on it bounds every
+        // line.
+        if let Some(size) = args.size {
+            if renderer.would_clip(size, tape, args.top_margin, args.bottom_margin) {
+                let max = renderer.max_size_pt_for_tape(tape, args.top_margin, args.bottom_margin);
+                eprintln!(
+                    "warning: {size}pt may be too large for {}mm tape and could be \
+                     clipped at the top/bottom; try --size {max:.1} or smaller",
+                    tape.width_mm()
+                );
+            }
+        }
+        renderer.render_text_ratios(
+            &text,
+            args.size,
+            ratios,
+            tape,
+            args.left_margin_mm,
+            args.right_margin_mm,
+            args.top_margin,
+            args.bottom_margin,
+        )?
+    } else if let Some(tape_length_mm) = args.max_tape_length_mm {
         // Multi-line mode: wrap text to fit the specified tape length.
         let size = match args.size {
             Some(size) => {
@@ -274,6 +469,22 @@ fn main() -> Result<()> {
         renderer.render_text(&text, size, tape, args.left_margin_mm, args.right_margin_mm, args.top_margin, args.bottom_margin)
     };
 
+    // Optional frame: post-process the rendered rows so the same
+    // frame appears in the print job and in every preview path.
+    let (mut rows, margin) = (rows, margin);
+    if args.frame {
+        if !(1..=3).contains(&args.frame_width) {
+            anyhow::bail!("--frame-width must be between 1 and 3, got {}", args.frame_width);
+        }
+        tpsr3700::font::apply_frame(
+            &mut rows,
+            tape.bitmap_bits(),
+            args.top_margin,
+            args.bottom_margin,
+            args.frame_width,
+        );
+    }
+
     let char_count = text.chars().count() as u32;
     let job = build_print_job(tape, char_count, &rows, margin);
 
@@ -281,6 +492,32 @@ fn main() -> Result<()> {
         std::fs::write(path, &job)?;
         eprintln!("wrote {} bytes to {}", job.len(), path.display());
         dump_explain(&job, tape, args.top_margin, args.bottom_margin);
+    }
+
+    // --preview-out: write the SVG preview (rendered from the exact
+    // raster rows that would be printed) and exit. Never prompts and
+    // never sends the job to the printer.
+    if let Some(path) = &args.preview_out {
+        #[cfg(feature = "preview")]
+        {
+            let right_margin_rows = tpsr3700::font::mm_to_rows(args.right_margin_mm);
+            let svg = tpsr3700::preview::build_svg_preview(
+                &rows,
+                tape,
+                &text,
+                args.top_margin,
+                args.bottom_margin,
+                margin,
+                right_margin_rows,
+            );
+            std::fs::write(path, svg)?;
+            eprintln!("preview written to {}", path.display());
+            return Ok(());
+        }
+        #[cfg(not(feature = "preview"))]
+        {
+            anyhow::bail!("--preview-out requires the crate to be built with the `preview` feature");
+        }
     }
 
     if !args.skip_preview {
@@ -321,4 +558,76 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{detect_tape_json, nominal_mm_for_detected_index, parse_line_ratios};
+    use tpsr3700::tepra::TapeWidth;
+
+    #[test]
+    fn nominal_mm_matches_protocol_table() {
+        // docs/protocol.md section 1.5: [4, 6, 9, 12, 18, 24, 36, 50]
+        assert_eq!(nominal_mm_for_detected_index(0), Some(4));
+        assert_eq!(nominal_mm_for_detected_index(1), Some(6));
+        assert_eq!(nominal_mm_for_detected_index(2), Some(9));
+        assert_eq!(nominal_mm_for_detected_index(3), Some(12));
+        assert_eq!(nominal_mm_for_detected_index(4), Some(18));
+        assert_eq!(nominal_mm_for_detected_index(5), Some(24));
+        assert_eq!(nominal_mm_for_detected_index(6), Some(36));
+        assert_eq!(nominal_mm_for_detected_index(7), Some(50));
+        assert_eq!(nominal_mm_for_detected_index(8), None);
+        assert_eq!(nominal_mm_for_detected_index(255), None);
+    }
+
+    #[test]
+    fn detect_json_supported_width() {
+        assert_eq!(
+            detect_tape_json(Some(TapeWidth::Mm18), 4),
+            "{\"tape_mm\": 18, \"index\": 4, \"supported\": true}"
+        );
+        assert_eq!(
+            detect_tape_json(Some(TapeWidth::Mm6), 1),
+            "{\"tape_mm\": 6, \"index\": 1, \"supported\": true}"
+        );
+    }
+
+    #[test]
+    fn detect_json_unsupported_width_reports_nominal_mm() {
+        // 9mm (index 2) and 36mm (index 6) are real widths the driver
+        // cannot print to yet; they must still be reported by name.
+        assert_eq!(
+            detect_tape_json(None, 2),
+            "{\"tape_mm\": 9, \"index\": 2, \"supported\": false}"
+        );
+        assert_eq!(
+            detect_tape_json(None, 6),
+            "{\"tape_mm\": 36, \"index\": 6, \"supported\": false}"
+        );
+    }
+
+    #[test]
+    fn detect_json_unknown_index_reports_null() {
+        assert_eq!(
+            detect_tape_json(None, 9),
+            "{\"tape_mm\": null, \"index\": 9, \"supported\": false}"
+        );
+    }
+
+    #[test]
+    fn parse_ratios_basic() {
+        assert_eq!(parse_line_ratios("7,3").unwrap(), vec![7.0, 3.0]);
+        assert_eq!(parse_line_ratios("1,1,1").unwrap(), vec![1.0, 1.0, 1.0]);
+        assert_eq!(parse_line_ratios(" 2.5 , 1 ").unwrap(), vec![2.5, 1.0]);
+        assert_eq!(parse_line_ratios("5").unwrap(), vec![5.0]);
+    }
+
+    #[test]
+    fn parse_ratios_rejects_bad_values() {
+        assert!(parse_line_ratios("").is_err());
+        assert!(parse_line_ratios("7,0").is_err());
+        assert!(parse_line_ratios("7,-3").is_err());
+        assert!(parse_line_ratios("7,x").is_err());
+        assert!(parse_line_ratios("7,").is_err());
+    }
 }
