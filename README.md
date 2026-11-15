@@ -21,6 +21,8 @@ Print text labels directly from the command line — no Windows, no vendor softw
 - Multi-line printing via explicit `\n` line breaks — works with or without `--max-tape-length-mm`
 - Wrap-to-length: wrap text to a fixed label length, with a configurable maximum line count derived from the tape width (minimum line height: 3 mm)
 - Left / center / right alignment per line (within the label length with `--max-tape-length-mm`, otherwise within the widest line of a multi-line text)
+- Reliable job submission with `--wait`: wait for the printer to be idle before sending, write the job in chunks the printer can absorb as it prints, and fail rather than claim success when the printer never starts (see `docs/protocol.md` §1.6)
+- Print several different labels as one job (`--labels-file`), so the cut mode applies between them
 - Dump the raw job bytes to a file (useful for debugging without hardware)
 - SVG print preview before sending the job to the printer (shown by default; `--skip-preview` to bypass it)
 
@@ -77,6 +79,16 @@ tpsr3700 [OPTIONS] <TEXT>
 | `--dump <PATH>` | — | Write the raw job bytes to a file (in addition to, or instead of, printing). |
 | `--no-print` | — | Skip sending the job to the printer. Useful with `--dump`. |
 | `--skip-preview` | — | Skip the SVG print preview and print immediately. A preview is shown by default (requires the `preview` build feature, enabled by default). |
+| `--wait` | off | Wait for the printer around the job: block until it is idle before sending, then poll the status until it is idle again. Fails if the printer never reported itself busy, which means it did not take the job. Status changes go to stderr. |
+| `--preview-out <PATH>` | — | Write an SVG preview of the job to this path and exit without printing or prompting. Rendered from the raster rows that would be sent. For web front ends. |
+| `--detect-tape` | — | Query the loaded tape width, print one line of JSON on stdout, and exit: `{"tape_mm": 18, "index": 4, "supported": true, "device_id": "...", "model": "sr3900p"}`. |
+| `--printer-status` | — | Print the printer's current state and exit, without printing: the raw 8-byte vendor status (activity byte and tape index) and the printer-class port status byte. Diagnostic only. |
+| `--line-ratios <R,R>` | — | Per-line font size ratios for multi-line text (e.g. `7,3`). The count must equal the number of lines. See [Multi-line rules](#multi-line-rules). |
+| `--frame` | off | Draw a rectangular frame around the printed content, hugging the ink with ~1mm of padding. Composes with multi-line text, `--line-ratios`, `--align` and wrapping, and appears in previews. |
+| `--frame-width <DOTS>` | `2` | Frame line thickness in dots (1-3). Only with `--frame`. |
+| `--vid <HEX>` / `--pid <HEX>` | `0d8a` / `0103` | USB vendor/product ID override, in hex. Default to `TEPRA_USB_VID` / `TEPRA_USB_PID`, else the SR3700P's IDs. Find them with `lsusb`. |
+| `--send-header` | off | Also send the 2179-byte header block. The Windows driver does not, and sending it makes the printer stall ~20s before printing. Experiments only. |
+| `--no-soft-reset` | off | Skip the printer-class SOFT_RESET normally issued right before the job. Experiments only. |
 
 ### Examples
 
@@ -216,6 +228,9 @@ Windows も純正ソフトも不要で、コマンドラインから直接テキ
 - **複数行印刷**: テキスト中の `\n` で改行 — `--max-tape-length-mm` の有無に関わらず使用可能
 - ラベル長指定による折り返し（テープ幅から最大行数を自動計算、最低行高さ 3 mm）
 - 行ごとの左寄せ / 中央揃え / 右寄せ（`--max-tape-length-mm` 使用時）
+- ケーブル表示ラベルの配置（`--cable`）: テープ上端の印刷エリアだけに印字
+- `--labels-file` で内容の異なる複数ラベルを 1 ジョブとして印刷（カット設定がラベル間にも効く）
+- `--wait` による確実なジョブ送信: 送信前にプリンタが idle になるのを待ち、プリンタが印刷しながら受け取れる大きさに分けて書き込み、動作開始を確認できなければ成功と報告せずエラーにする（`docs/protocol.md` §1.6）
 - 生のジョブバイト列をファイルにダンプ（ハードウェアなしでのデバッグに便利）
 - 印刷前の SVG プレビュー表示（デフォルトで表示。`--skip-preview` で無効化可能）
 
@@ -270,6 +285,16 @@ tpsr3700 [オプション] <テキスト>
 | `--dump <PATH>` | — | 生のジョブバイト列をファイルに書き出す（印刷と併用可）。 |
 | `--no-print` | — | プリンターへの送信をスキップ。`--dump` と組み合わせて使用。 |
 | `--skip-preview` | — | SVG 印刷プレビューを表示せず、すぐに印刷する。デフォルトではプレビューを表示する（`preview` ビルドフィーチャーが必要。デフォルトで有効）。 |
+| `--wait` | 無効 | ジョブの前後でプリンタを待つ。送信前は idle になるまで待ち（印刷中やカット中に送るとジョブが捨てられるため）、送信後は idle に戻るまで状態を見る。プリンタが一度も動作中にならなかった場合は、ジョブを受け取っていないとみなしてエラーにする。状態の変化は標準エラー出力に出る。 |
+| `--preview-out <PATH>` | — | ジョブの SVG プレビューを指定パスに書き出して終了する（印刷も確認プロンプトもしない）。実際に送るラスタ行から描画する。Web フロントエンド用。 |
+| `--detect-tape` | — | 装着テープ幅を問い合わせ、JSON 1 行を標準出力に出して終了する: `{"tape_mm": 18, "index": 4, "supported": true, "device_id": "...", "model": "sr3900p"}`。 |
+| `--printer-status` | — | 印刷せずにプリンタの現在の状態を出して終了する。8 バイトの生ステータス（動作状態バイトとテープインデックス）と、プリンタクラスのポート状態バイト。診断用。 |
+| `--line-ratios <R,R>` | — | 複数行テキストの行ごとの文字サイズ比率（例: `7,3`）。個数は行数と一致する必要がある。[複数行印刷のルール](#複数行印刷のルール)を参照。 |
+| `--frame` | 無効 | 印字内容の周囲に枠線を描く（インクの外周に約 1mm の余白を取る）。複数行・`--line-ratios`・`--align`・折り返しと併用でき、プレビューにも出る。 |
+| `--frame-width <DOTS>` | `2` | 枠線の太さ（ドット、1〜3）。`--frame` と併用。 |
+| `--vid <HEX>` / `--pid <HEX>` | `0d8a` / `0103` | USB の vendor/product ID を 16 進で上書きする。未指定なら `TEPRA_USB_VID` / `TEPRA_USB_PID`、それも無ければ SR3700P の値。`lsusb` で確認する。 |
+| `--send-header` | 無効 | 2179 バイトのヘッダブロックも送る。公式ドライバは送らず、送ると印刷開始が 20 秒ほど遅れる。実験用。 |
+| `--no-soft-reset` | 無効 | ジョブ直前に送るプリンタクラスの SOFT_RESET を省く。実験用。 |
 
 ### 使用例
 

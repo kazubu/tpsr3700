@@ -230,9 +230,10 @@ struct Args {
     cut: CutMode,
 
     /// Lay the text out for a cable-marking label: restrict printing to
-    /// the printable band at the top of the tape (24mm: top 8mm, 36mm:
-    /// top 13mm), leaving the rest clear to wrap around the cable. Only
-    /// 24mm and 36mm tape have a cable-marking variant.
+    /// the printable band at the top of the tape (24mm: top 7.5mm, 36mm:
+    /// top 12.5mm — half a millimetre under the nominal 8mm/13mm, which
+    /// overflows in practice), leaving the rest clear to wrap around the
+    /// cable. Only 24mm and 36mm tape have a cable-marking variant.
     #[arg(long)]
     cable: bool,
 
@@ -258,9 +259,12 @@ struct Args {
     #[arg(long)]
     no_soft_reset: bool,
 
-    /// After sending, poll the printer status every 500ms and return
-    /// only when it is idle again (prints status changes to stderr).
-    /// Prevents the next job from being sent while this one prints.
+    /// Wait for the printer around the job: before sending, wait until
+    /// it is idle, so the job is not sent into a printer that is still
+    /// printing or cutting (which can drop it); after sending, poll the
+    /// status until it is idle again, and fail if the printer never
+    /// reported itself busy, because then it did not take the job.
+    /// Status changes are printed to stderr.
     #[arg(long)]
     wait: bool,
 
