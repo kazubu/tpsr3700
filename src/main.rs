@@ -656,7 +656,7 @@ fn render_label(
             args.align,
             args.top_margin,
             args.bottom_margin,
-        )
+        )?
     } else {
         // Single-line mode, or implicit multi-line via '\n'.
         let num_lines = text.lines().count().max(1);
@@ -683,7 +683,7 @@ fn render_label(
                 size
             }
         };
-        renderer.render_text_aligned(text, size, tape, args.left_margin_mm, args.right_margin_mm, args.top_margin, args.bottom_margin, args.align)
+        renderer.render_text_aligned(text, size, tape, args.left_margin_mm, args.right_margin_mm, args.top_margin, args.bottom_margin, args.align)?
     };
 
     // Optional frame: post-process the rendered rows so the same

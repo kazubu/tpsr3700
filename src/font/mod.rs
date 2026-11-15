@@ -330,7 +330,9 @@ impl FontRenderer {
     /// length; lines are left-aligned (see [`render_text_aligned`]).
     ///
     /// Returns `(rows, margin_rows)` where `margin_rows` is the number of
-    /// leading (left) blank rows (matching the `T` command semantics).
+    /// leading (left) blank rows (matching the `T` command semantics), or
+    /// an error if the text has more lines than fit on the tape (nothing
+    /// is ever silently dropped).
     pub fn render_text(
         &self,
         text: &str,
@@ -340,7 +342,7 @@ impl FontRenderer {
         right_margin_mm: f32,
         top_margin_bits: usize,
         bottom_margin_bits: usize,
-    ) -> (Vec<Vec<u8>>, u32) {
+    ) -> Result<(Vec<Vec<u8>>, u32)> {
         self.render_text_aligned(text, size_pt, tape, left_margin_mm, right_margin_mm, top_margin_bits, bottom_margin_bits, TextAlign::Left)
     }
 
@@ -358,7 +360,7 @@ impl FontRenderer {
         top_margin_bits: usize,
         bottom_margin_bits: usize,
         align: TextAlign,
-    ) -> (Vec<Vec<u8>>, u32) {
+    ) -> Result<(Vec<Vec<u8>>, u32)> {
         let size_px = pt_to_px(size_pt, tape.model);
         let total_bits = tape.bitmap_bits();
         let head_bits = tape
@@ -371,7 +373,14 @@ impl FontRenderer {
         let line_strs: Vec<&str> = text.split('\n').collect();
         if line_strs.len() > 1 {
             let max_lines = ((tape.width_mm() as f32 / MIN_LINE_HEIGHT_MM).floor() as usize).max(1);
-            let num_lines = line_strs.len().min(max_lines).max(1);
+            if line_strs.len() > max_lines {
+                anyhow::bail!(
+                    "too many lines ({}) for {}mm tape (max {max_lines}); shorten the text or use wider tape",
+                    line_strs.len(),
+                    tape.width_mm()
+                );
+            }
+            let num_lines = line_strs.len();
             let band_head_bits = head_bits / num_lines;
 
             // Rasterize each line and find the widest advance width.
@@ -436,7 +445,7 @@ impl FontRenderer {
             padded.extend(std::iter::repeat(blank_row.clone()).take(left_rows as usize));
             padded.extend(trimmed);
             padded.extend(std::iter::repeat(blank_row).take(right_rows as usize));
-            return (padded, left_rows);
+            return Ok((padded, left_rows));
         }
 
         // Single-line path (original behaviour).
@@ -519,7 +528,7 @@ impl FontRenderer {
         padded.extend(trimmed);
         padded.extend(std::iter::repeat(blank_row).take(right_rows as usize));
 
-        (padded, left_rows)
+        Ok((padded, left_rows))
     }
 
     /// Validate per-line size ratios (used by [`render_text_ratios`]).
@@ -661,7 +670,7 @@ impl FontRenderer {
         if line_strs.len() == 1 && fixed_length_mm.is_none() {
             let size = size_pt
                 .unwrap_or_else(|| self.max_size_pt_for_tape(tape, top_margin_bits, bottom_margin_bits));
-            return Ok(self.render_text(
+            return self.render_text(
                 text,
                 size,
                 tape,
@@ -669,7 +678,7 @@ impl FontRenderer {
                 right_margin_mm,
                 top_margin_bits,
                 bottom_margin_bits,
-            ));
+            );
         }
 
         let total_bits = tape.bitmap_bits();
@@ -816,7 +825,7 @@ impl FontRenderer {
         align: TextAlign,
         top_margin_bits: usize,
         bottom_margin_bits: usize,
-    ) -> (Vec<Vec<u8>>, u32) {
+    ) -> Result<(Vec<Vec<u8>>, u32)> {
         let total_bits = tape.bitmap_bits();
         let head_bits = tape
             .bitmap_bits()
@@ -839,7 +848,14 @@ impl FontRenderer {
             .map(|s| s.to_string())
             .collect();
 
-        let mut num_lines = initial_segments.len().min(max_lines).max(1);
+        if initial_segments.len() > max_lines {
+            anyhow::bail!(
+                "too many lines ({}) for {}mm tape (max {max_lines}); shorten the text or use wider tape",
+                initial_segments.len(),
+                tape.width_mm()
+            );
+        }
+        let mut num_lines = initial_segments.len().max(1);
 
         // Outer retry loop: re-run with num_lines+1 when overflow can't be absorbed.
         let confirmed: Vec<(String, f32)> = 'retry: loop {
@@ -905,8 +921,13 @@ impl FontRenderer {
                         num_lines += 1;
                         continue 'retry;
                     } else {
-                        // Can't grow further — discard overflow.
-                        break 'band;
+                        // Can't grow further: refuse rather than drop text.
+                        anyhow::bail!(
+                            "text does not fit on a {tape_length_mm}mm label at this size \
+                             (even with {max_lines} lines on {}mm tape); shorten the text, \
+                             reduce the size, or use a longer label",
+                            tape.width_mm()
+                        );
                     }
                 }
 
@@ -979,7 +1000,7 @@ impl FontRenderer {
         padded.extend(trimmed);
         padded.extend(std::iter::repeat(blank_row).take(right_rows as usize));
 
-        (padded, left_rows)
+        Ok((padded, left_rows))
     }
 
     /// Split `text` at the first character that would cause the cumulative
@@ -1211,7 +1232,7 @@ mod tests {
         let text = "WWWWWWWW\ni";
         let mut extents = Vec::new();
         for align in [TextAlign::Left, TextAlign::Center, TextAlign::Right] {
-            let (rows, margin) = renderer.render_text_aligned(text, 12.0, tape, 0.0, 0.0, 2, 0, align);
+            let (rows, margin) = renderer.render_text_aligned(text, 12.0, tape, 0.0, 0.0, 2, 0, align).unwrap();
             assert_eq!(margin, 0);
             let long = band_ink_extent(&rows, tape, 0, 2, 2, 0);
             let short = band_ink_extent(&rows, tape, 1, 2, 2, 0);
@@ -1274,6 +1295,30 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("margins"), "{err}");
+    }
+
+    #[test]
+    fn too_many_lines_is_an_error_not_a_truncation() {
+        // 6mm tape fits 2 lines (3mm minimum each); a third line must not
+        // be silently dropped on any render path.
+        let renderer = default_renderer();
+        let tape = Tape::sr3700p(TapeWidth::Mm6);
+        let two = renderer.render_text("A\nB", 8.0, tape, 0.0, 0.0, 2, 0).unwrap();
+        let err = renderer.render_text("A\nB\nC", 8.0, tape, 0.0, 0.0, 2, 0).unwrap_err().to_string();
+        assert!(err.contains("too many lines"), "{err}");
+        assert!(!two.0.is_empty());
+        let err = renderer
+            .render_text_multiline("A\nB\nC", Some(8.0), tape, 0.0, 0.0, 40.0, TextAlign::Left, 2, 0)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("too many lines"), "{err}");
+        // Wrap mode: text that cannot fit even with the maximum line count
+        // is refused instead of having its tail discarded.
+        let err = renderer
+            .render_text_multiline("WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW", Some(20.0), tape, 0.0, 0.0, 12.0, TextAlign::Left, 2, 0)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not fit"), "{err}");
     }
 
     #[test]
@@ -1372,7 +1417,7 @@ mod tests {
             TextAlign::Left,
             TapeWidth::HEAD_MARGIN_BITS,
             TapeWidth::HEAD_MARGIN_BITS,
-        );
+        ).unwrap();
         assert!(!rows.is_empty());
         assert!(margin > 0);
     }
@@ -1427,7 +1472,7 @@ mod tests {
                 TextAlign::Left,
                 TapeWidth::HEAD_MARGIN_BITS,
                 TapeWidth::HEAD_MARGIN_BITS,
-            );
+            ).unwrap();
             let ho = tape.head_offset();
             let hb = tape.head_bits();
             let half = hb / 2;
@@ -1470,7 +1515,7 @@ mod tests {
             TextAlign::Left,
             TapeWidth::HEAD_MARGIN_BITS,
             TapeWidth::HEAD_MARGIN_BITS,
-        );
+        ).unwrap();
 
         // Output must be non-empty and contain ink somewhere.
         assert!(!rows.is_empty());
@@ -1503,7 +1548,7 @@ mod tests {
             TextAlign::Left,
             TapeWidth::HEAD_MARGIN_BITS,
             TapeWidth::HEAD_MARGIN_BITS,
-        );
+        ).unwrap();
 
         assert!(!rows.is_empty(), "expected non-empty output");
 
@@ -1743,7 +1788,7 @@ mod tests {
             TextAlign::Left,
             0,   // top_margin_bits
             0,   // bottom_margin_bits
-        );
+        ).unwrap();
 
         assert!(!rows.is_empty(), "expected non-empty output");
 
@@ -1905,7 +1950,7 @@ mod tests {
             TextAlign::Left,
             TapeWidth::HEAD_MARGIN_BITS,
             TapeWidth::HEAD_MARGIN_BITS,
-        );
+        ).unwrap();
 
         assert!(!rows.is_empty(), "expected non-empty output");
 
@@ -2042,7 +2087,7 @@ mod tests {
             DEFAULT_FEED_MARGIN_MM,
             TapeWidth::HEAD_MARGIN_BITS,
             TapeWidth::HEAD_MARGIN_BITS,
-        );
+        ).unwrap();
 
         assert!(!rows.is_empty(), "expected non-empty output");
 
@@ -2176,7 +2221,7 @@ mod tests {
             DEFAULT_FEED_MARGIN_MM,
             top_margin,
             bottom_margin,
-        );
+        ).unwrap();
         assert!(!rows.is_empty(), "expected non-empty output");
         assert_ascii_art(&rows, tape, top_margin, bottom_margin, 120, "\
 |.....................................................|.\n\
@@ -2407,7 +2452,7 @@ mod tests {
         let (legacy, _) = renderer.render_text(
             "HOST\n192.168.0.1", max / 2.0, tape,
             DEFAULT_FEED_MARGIN_MM, DEFAULT_FEED_MARGIN_MM, m, m,
-        );
+        ).unwrap();
         let (ratio, _) = renderer.render_text_ratios(
             "HOST\n192.168.0.1", None, &[1.0, 1.0], tape,
             DEFAULT_FEED_MARGIN_MM, DEFAULT_FEED_MARGIN_MM, m, m,
@@ -2526,7 +2571,7 @@ mod tests {
         let (rows, margin) = renderer.render_text(
             "Frame", 24.0, tape, 3.0, 3.0,
             TapeWidth::HEAD_MARGIN_BITS, TapeWidth::HEAD_MARGIN_BITS,
-        );
+        ).unwrap();
         let mut framed = rows.clone();
         apply_frame(&mut framed, tape.bitmap_bits(), 2, 8, 2);
         assert_eq!(framed.len(), rows.len());
