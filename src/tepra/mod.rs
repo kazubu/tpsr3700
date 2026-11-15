@@ -169,15 +169,22 @@ impl TapeWidth {
         }
     }
 
-    /// Height of the printable (white) area of a cable-marking label of
-    /// this width, in millimetres, measured from the top edge of the
-    /// printable band. Cable-marking tape carries the text in a band at
-    /// one end and leaves the rest clear to wrap around the cable.
-    /// `None` for widths with no cable-marking variant.
+    /// Height to lay a cable-marking label's text out in, in
+    /// millimetres, measured from the top edge of the tape. Cable
+    /// marking tape carries the text in a printable area at one end and
+    /// leaves the rest clear to wrap around the cable. `None` for widths
+    /// with no cable-marking variant.
+    ///
+    /// These are 0.5mm below the labels' nominal printable areas (24mm:
+    /// 8mm, 36mm: 13mm). On an SR750 with 24mm tape, text laid out to
+    /// the full 8mm overflowed, 7.8mm was marginal and 7.5mm fit, so the
+    /// nominal figure has about 0.5mm of tolerance in practice. The same
+    /// allowance is applied to 36mm by analogy; it has not been checked
+    /// on hardware. `--cable-mm` overrides this.
     pub fn cable_printable_mm(self) -> Option<f32> {
         match self {
-            TapeWidth::Mm24 => Some(8.0),
-            TapeWidth::Mm36 => Some(13.0),
+            TapeWidth::Mm24 => Some(7.5),
+            TapeWidth::Mm36 => Some(12.5),
             _ => None,
         }
     }
@@ -448,8 +455,10 @@ mod tests {
 
     #[test]
     fn cable_printable_area() {
-        assert_eq!(TapeWidth::Mm24.cable_printable_mm(), Some(8.0));
-        assert_eq!(TapeWidth::Mm36.cable_printable_mm(), Some(13.0));
+        // 0.5mm below the nominal 8mm / 13mm printable areas; 7.5mm was
+        // the largest that reliably fit on 24mm tape on an SR750.
+        assert_eq!(TapeWidth::Mm24.cable_printable_mm(), Some(7.5));
+        assert_eq!(TapeWidth::Mm36.cable_printable_mm(), Some(12.5));
         for w in [TapeWidth::Mm4, TapeWidth::Mm6, TapeWidth::Mm9, TapeWidth::Mm12, TapeWidth::Mm18] {
             assert_eq!(w.cable_printable_mm(), None, "{w:?}");
         }
