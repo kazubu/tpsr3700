@@ -194,9 +194,14 @@ impl TapeWidth {
     ///
     /// Confirmed on hardware by loading each tape and running
     /// `--detect-tape`: 0 = no tape loaded, 1 = 6mm, 2 = 9mm, 3 = 12mm,
-    /// 4 = 18mm, 11 = 4mm. 5 = 24mm and 6 = 36mm continue the 6..36mm
-    /// run and are assumed. Note that 4mm sits at 11, not at 0, so the
-    /// indices are not simply positions in the published width lineup.
+    /// 4 = 18mm, 5 = 24mm, 11 = 4mm. 6 = 36mm continues the run and is
+    /// assumed. Note that 4mm sits at 11, not at 0, so the indices are
+    /// not simply positions in the published width lineup.
+    ///
+    /// The index reports the tape *width* only: a 24mm cable-marking
+    /// tape (SV24K) reports 5, the same as plain 24mm tape, so cable
+    /// labels cannot be detected automatically and `--cable` has to be
+    /// set by hand.
     pub fn from_detected_index(index: u8) -> Option<Self> {
         match index {
             1 => Some(TapeWidth::Mm6),

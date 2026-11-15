@@ -150,9 +150,11 @@ The mapping, established by loading each tape and running
 | 6     | 36mm |
 | 11    | 4mm |
 
-Confirmed on hardware: 0, 1, 2, 3, 4 and 11 (6/12/18mm on an SR3700P;
-no tape, 9mm and 4mm on an SR750). 5 and 6 continue the 6..36mm run and
-are assumed. Note that 4mm sits at 11, not at 0, so the indices are not
+Confirmed on hardware: 0, 1, 2, 3, 4, 5 and 11 (6/12/18mm on an
+SR3700P; no tape, 9mm, 4mm and 24mm on an SR750). 6 continues the run
+and is assumed. The index reports the tape width only: a 24mm
+cable-marking tape (SV24K) reports 5, the same as plain 24mm tape, so
+cable labels cannot be detected automatically. Note that 4mm sits at 11, not at 0, so the indices are not
 simply positions in KING JIM's published width lineup; no index is known
 to mean 50mm. The other 7 bytes are not fully understood;
 byte 0 is a constant `0x08` and byte 1 is an activity state (`00` idle,
