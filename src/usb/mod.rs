@@ -294,18 +294,54 @@ impl Printer {
         Ok(())
     }
 
-    /// Polls the printer status every 500ms (as the Windows driver does)
-    /// until the printer has gone busy and idle again, calling
-    /// `on_change` with every distinct status seen. Gives up after
-    /// `timeout`. If the printer never reports busy within the first
-    /// `grace` period it is assumed to have finished (or ignored the
-    /// job) and the function returns.
+    /// Waits for the printer to be idle, so a job is never sent into a
+    /// printer that is still printing or cutting the previous one.
+    ///
+    /// This matters because the job is preceded by a SOFT_RESET: sending
+    /// that while the printer is still working aborts whatever it is
+    /// doing, and a job sent while it is busy can be dropped outright.
+    pub fn wait_until_ready(
+        &self,
+        timeout: Duration,
+        mut on_change: impl FnMut(PrinterStatus),
+    ) -> Result<PrinterStatus> {
+        let start = std::time::Instant::now();
+        let mut last: Option<PrinterStatus> = None;
+        loop {
+            let st = self.get_status()?;
+            if last != Some(st) {
+                on_change(st);
+                last = Some(st);
+            }
+            if st.is_idle() {
+                return Ok(st);
+            }
+            if start.elapsed() >= timeout {
+                bail!(
+                    "printer is still busy after {:?}, not sending the job (status {:02x?})",
+                    timeout,
+                    st.raw
+                );
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    /// Outcome of [`Printer::wait_until_idle`].
+    ///
+    /// `saw_busy` is the part that matters to the caller: if the printer
+    /// never reported itself busy, the job was almost certainly dropped
+    /// (or never started), and reporting success would be a lie.
+    ///
+    /// Polls every 200ms until the printer first goes busy and every
+    /// 500ms after that (the Windows driver polls at 500ms throughout);
+    /// the faster initial poll makes a very short job harder to miss.
     pub fn wait_until_idle(
         &self,
         timeout: Duration,
         grace: Duration,
         mut on_change: impl FnMut(PrinterStatus),
-    ) -> Result<PrinterStatus> {
+    ) -> Result<(PrinterStatus, bool)> {
         let start = std::time::Instant::now();
         let mut last: Option<PrinterStatus> = None;
         let mut seen_busy = false;
@@ -318,30 +354,69 @@ impl Printer {
             if !st.is_idle() {
                 seen_busy = true;
             } else if seen_busy || start.elapsed() >= grace {
-                return Ok(st);
+                return Ok((st, seen_busy));
             }
             if start.elapsed() >= timeout {
                 bail!("printer still busy after {:?} (status {:02x?})", timeout, st.raw);
             }
-            std::thread::sleep(Duration::from_millis(500));
+            let poll = if seen_busy { 500 } else { 200 };
+            std::thread::sleep(Duration::from_millis(poll));
         }
     }
+
+    /// Bytes per bulk write. The printer only accepts what fits in its
+    /// buffer and makes room as it prints, so a whole multi-label job
+    /// cannot be handed over in one transfer: the write would block for
+    /// as long as the printing takes. Writing in chunks keeps every
+    /// single transfer short enough to finish well inside
+    /// [`Self::CHUNK_TIMEOUT`].
+    ///
+    /// It must stay a multiple of the bulk endpoint's maximum packet
+    /// size (512 at high speed, 64 at full speed), or every chunk would
+    /// end with a short packet, which a printer may read as the end of
+    /// the document. 32KiB is a multiple of both, so only the last chunk
+    /// of a job is short -- which is exactly what should mark its end.
+    const CHUNK_LEN: usize = 32 * 1024;
+
+    /// Timeout for one [`Self::CHUNK_LEN`] write. It has to cover the
+    /// time the printer needs to free that much buffer, which means
+    /// printing roughly that many rows of tape, so it is generous.
+    const CHUNK_TIMEOUT: Duration = Duration::from_secs(120);
 
     /// Sends a raw byte stream directly to the printer's bulk OUT
     /// endpoint, with no additional framing. Callers normally pass
     /// [`crate::tepra::builder::printer_payload`] of a job rather than
     /// the whole job (see there).
     pub fn send_job(&mut self, job: &[u8]) -> Result<()> {
+        self.send_job_with_progress(job, |_, _| {})
+    }
+
+    /// Same as [`Self::send_job`], but calls `on_progress(sent, total)`
+    /// after every chunk. Because the printer takes the bytes only as
+    /// fast as it prints them, this doubles as a progress signal for
+    /// long multi-label jobs.
+    pub fn send_job_with_progress(
+        &mut self,
+        job: &[u8],
+        mut on_progress: impl FnMut(usize, usize),
+    ) -> Result<()> {
         let mut sent = 0;
         while sent < job.len() {
+            let end = (sent + Self::CHUNK_LEN).min(job.len());
             let n = self
                 .handle
-                .write_bulk(self.endpoint_out, &job[sent..], Duration::from_secs(30))
-                .with_context(|| format!("failed to send print job after {sent} bytes"))?;
+                .write_bulk(self.endpoint_out, &job[sent..end], Self::CHUNK_TIMEOUT)
+                .with_context(|| {
+                    format!(
+                        "failed to send print job after {sent} of {} bytes",
+                        job.len()
+                    )
+                })?;
             if n == 0 {
                 bail!("USB bulk write made no progress after {sent} of {} bytes", job.len());
             }
             sent += n;
+            on_progress(sent, job.len());
         }
         Ok(())
     }

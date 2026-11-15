@@ -167,6 +167,12 @@ struct Args {
     #[arg(long)]
     detect_tape: bool,
 
+    /// Print the printer's current state and exit, without printing:
+    /// the raw 8-byte vendor status (activity byte and tape index) and
+    /// the USB printer-class port status byte. Diagnostic only.
+    #[arg(long)]
+    printer_status: bool,
+
 
     /// Tape width in millimeters (4, 6, 9, 12, 18, 24, 36).
     /// If omitted, the width is auto-detected by querying the printer
@@ -427,6 +433,26 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // --printer-status: dump what the printer reports about itself and
+    // exit. Used to tell "the job was refused" apart from "the job was
+    // never sent" when a print silently produces nothing.
+    if args.printer_status {
+        let printer = open_printer(&args)?;
+        let st = printer.get_status()?;
+        println!(
+            "status {:02x?} activity={:#04x} idle={} tape_index={}",
+            st.raw,
+            st.activity(),
+            st.is_idle(),
+            st.tape_index()
+        );
+        match printer.get_port_status() {
+            Ok(ps) => println!("port_status {ps:#04x}"),
+            Err(e) => println!("port_status unavailable: {e}"),
+        }
+        return Ok(());
+    }
+
     let labels: Vec<String> = match &args.labels_file {
         Some(_) if args.feed_mm.is_some() => unreachable!("clap rejects --feed-mm with --labels-file"),
         _ if args.feed_mm.is_some() => vec![String::new()],
@@ -651,12 +677,37 @@ fn main() -> Result<()> {
         // Same sequence as the SR3900P Windows driver (docs/protocol.md
         // section 1.6): SOFT_RESET, bulk-write the job without the
         // header block, then poll the status until idle.
+        //
+        // With one addition at the front: wait until the printer is
+        // idle. A job sent while the previous one is still printing or
+        // cutting can be dropped, and the SOFT_RESET that precedes it
+        // would abort that previous job -- either way a label goes
+        // missing while both jobs report success.
+        let t0 = std::time::Instant::now();
+        if args.wait {
+            printer.wait_until_ready(
+                std::time::Duration::from_secs(120),
+                |st| eprintln!("[{:.1}s] waiting for the printer, status {:02x?}", t0.elapsed().as_secs_f32(), st.raw),
+            )?;
+        }
+        match printer.get_port_status() {
+            Ok(ps) => eprintln!("port status {ps:#04x}"),
+            Err(e) => eprintln!("warning: could not read the port status: {e}"),
+        }
         if !args.no_soft_reset {
             printer.soft_reset()?;
         }
         let payload = if args.send_header { &job[..] } else { printer_payload(&job) };
-        let t0 = std::time::Instant::now();
-        printer.send_job(payload)?;
+        // The printer takes the bytes only as fast as it prints them, so
+        // for a multi-label job these are also progress reports. The web
+        // front end parses them to move its progress bar.
+        let mut reported = 0usize;
+        printer.send_job_with_progress(payload, |sent, total| {
+            if sent == total || sent - reported >= 64 * 1024 {
+                reported = sent;
+                eprintln!("progress sent={sent} total={total}");
+            }
+        })?;
         eprintln!(
             "sent job to printer ({} bytes{}) in {:.2}s",
             payload.len(),
@@ -664,11 +715,19 @@ fn main() -> Result<()> {
             t0.elapsed().as_secs_f32()
         );
         if args.wait {
-            let st = printer.wait_until_idle(
+            let (st, saw_busy) = printer.wait_until_idle(
                 std::time::Duration::from_secs(180 + 30 * labels.len() as u64),
-                std::time::Duration::from_secs(5),
+                std::time::Duration::from_secs(10),
                 |st| eprintln!("[{:.1}s] status {:02x?}", t0.elapsed().as_secs_f32(), st.raw),
             )?;
+            if !saw_busy {
+                anyhow::bail!(
+                    "the printer never reported itself busy after the job was sent \
+                     (status {:02x?}); it most likely did not accept the job, so nothing \
+                     was printed. Check the printer for an error, then try again.",
+                    st.raw
+                );
+            }
             eprintln!("printer idle after {:.1}s (status {:02x?})", t0.elapsed().as_secs_f32(), st.raw);
         }
     }

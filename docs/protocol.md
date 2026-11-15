@@ -199,6 +199,30 @@ same job minus its 2179-byte header block. No bulk IN reads, no
 zero-length packets, and no other requests occur. The driver also
 interleaves a `C1 01` status read between its ~4 KB bulk chunks.
 
+#### What this driver sends
+
+`--wait` follows the same shape, with the status reads used as checks
+rather than just logging:
+
+1. Poll `C1 01` until the activity byte is `00`, so the job is never
+   sent into a printer that is still printing or cutting. The capture
+   shows the Windows driver reading an idle status before the job too.
+   This matters because the SOFT_RESET in step 3 aborts whatever the
+   printer is doing, and a job sent to a busy printer can be dropped.
+2. Read `A1 01` GET_PORT_STATUS and log it (`18` on an SR750). Only
+   logged: what its bits mean on a TEPRA is not established, so nothing
+   is refused on the strength of it.
+3. SOFT_RESET, then bulk-write the payload from the `C` command on.
+   The write is split into 32 KiB chunks, a multiple of the endpoint's
+   maximum packet size so that only the final chunk is short. The
+   printer accepts bytes only as fast as it prints them, so a long
+   multi-label job cannot be handed over in one transfer; the chunks
+   double as a progress signal.
+4. Poll `C1 01` until idle again. The job is reported as printed only
+   if the printer was seen busy at least once. Without that check a
+   dropped job is indistinguishable from a finished one, and the CLI
+   exits 0 having printed nothing.
+
 Consequences for this implementation:
 
 - `send_job` is given [`printer_payload`](../src/tepra/builder.rs) of the
