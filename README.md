@@ -57,11 +57,12 @@ tpsr3700 [OPTIONS] <TEXT>
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--model <MODEL>` | `sr3700p` (or `TEPRA_MODEL`) | Printer model: `sr3700p` (270 dpi, 192-dot head) or `sr3900p` (360 dpi, 384-dot head). Sets the dot pitch for every mm conversion, the dots per tape width, and model bytes in the job. |
+| `--model <MODEL>` | from the printer, else `sr3700p` | Printer model: `sr3700p` (270 dpi, 192-dot head) or `sr3900p` (360 dpi, 384-dot head). Sets the dot pitch for every mm conversion, the dots per tape width, and model bytes in the job. When omitted (and `TEPRA_MODEL` is unset) the model is taken from the printer's USB device ID (SR3700P → `sr3700p`; SR3900P, SR750 → `sr3900p`). |
 | `--tape-mm <MM>` | auto-detect | Tape width in mm: `4`, `6`, `9`, `12`, `18`, `24`, `36`. Omit to query the printer. Widths not captured for the selected model print with a warning (see `docs/protocol.md` §3.1). |
 | `--cut <MODE>` | `full` | `full` (cut through), `half` (cut the tape, not the backing paper), or `none`. |
 | `--copies <N>` | `1` | Print N identical labels in one job, cut apart per `--cut`. |
 | `--labels-file <PATH>` | — | Print several different labels as one job: the file holds the labels separated by ASCII RS (0x1E). Replaces TEXT. Each label gets `--copies` copies; `--cut` applies between all of them. |
+| `--feed-mm <MM>` | — | Feed that much blank tape instead of printing, then cut per `--cut`. A full/half cut also ejects the fixed head-to-cutter lead (~9mm on an SR750) as a separate leading scrap, so feed-and-cut yields that scrap plus the fed piece; feed without a cut to avoid the scrap. Replaces TEXT. |
 | `--size <PT>` | auto | Font size in points (as shown in the TEPRA app, e.g. `36`). Omit for the largest size that fits. |
 | `--left-margin-mm <MM>` | `4.0` | Blank feed margin (mm) added before the printed content (left side as the label exits the printer). 1mm more than the right by default because the SR3900P trims the leading edge slightly. |
 | `--right-margin-mm <MM>` | `3.0` | Blank feed margin (mm) added after the printed content (right side). |
@@ -247,11 +248,12 @@ tpsr3700 [オプション] <テキスト>
 
 | オプション | デフォルト | 説明 |
 |-----------|-----------|------|
-| `--model <MODEL>` | `sr3700p`（または `TEPRA_MODEL`） | 機種: `sr3700p`（270 dpi、192 ドット）か `sr3900p`（360 dpi、384 ドット）。mm 換算の解像度、テープ幅ごとのドット数、ジョブ内の機種バイトが切り替わる。 |
+| `--model <MODEL>` | プリンタから判定、無ければ `sr3700p` | 機種: `sr3700p`（270 dpi、192 ドット）か `sr3900p`（360 dpi、384 ドット）。mm 換算の解像度、テープ幅ごとのドット数、ジョブ内の機種バイトが切り替わる。省略時（`TEPRA_MODEL` も未設定）は USB デバイス ID の機種名から判定（SR3700P → `sr3700p`、SR3900P / SR750 → `sr3900p`）。 |
 | `--tape-mm <MM>` | 自動検出 | テープ幅（mm）: `4`・`6`・`9`・`12`・`18`・`24`・`36`。省略時はプリンターに問い合わせ。選択した機種でキャプチャ未取得の幅は警告付きで印刷（`docs/protocol.md` §3.1）。 |
 | `--cut <MODE>` | `full` | `full`（フルカット）、`half`（ハーフカット: 台紙を残す）、`none`（カットしない）。 |
 | `--copies <N>` | `1` | 同じラベルを 1 ジョブで N 枚印刷（`--cut` の設定で切り分け）。 |
 | `--labels-file <PATH>` | — | 内容の異なる複数ラベルを 1 ジョブで印刷。ファイル内のラベルは ASCII RS (0x1E) 区切り。TEXT の代わりに指定。各ラベルに `--copies`、ラベル間に `--cut` が効く。 |
+| `--feed-mm <MM>` | — | 印刷せずに指定長の空白テープを送って `--cut` でカット。フル／ハーフカットではヘッド〜カッター間（SR750 で約 9mm）が先頭の切れ端として別に排出されるため、送ってカットすると切れ端＋指定長の 2 枚になる。切れ端を出したくなければカットなしで送る。TEXT の代わりに指定。 |
 | `--size <PT>` | 自動 | フォントサイズ（ポイント、TEPRA アプリの表示と同じ。例: `36`）。省略時はテープに収まる最大サイズ。 |
 | `--left-margin-mm <MM>` | `4.0` | 印字内容の前（ラベルがプリンターから出る側＝左端）に追加する余白（mm）。SR3900P は先端側が少し短く出るため、既定で右より 1mm 大きい。 |
 | `--right-margin-mm <MM>` | `3.0` | 印字内容の後（右端）に追加する余白（mm）。 |

@@ -84,7 +84,32 @@ impl Model {
 
     /// Every model.
     pub const ALL: [Model; 2] = [Model::Sr3700p, Model::Sr3900p];
+
+    /// Guesses the model from the USB printer-class device ID string
+    /// (`MFG:KING JIM;CMD:ESCPL2;MDL:TEPRA PRO SR3700P;CLS:PRINTER;`) or
+    /// the USB product string, by the model name it contains. Printers
+    /// that share the SR3900P's head (360 dpi, 384 dots) map to
+    /// [`Model::Sr3900p`]; unknown names return `None`.
+    pub fn from_device_name(name: &str) -> Option<Model> {
+        let upper = name.to_ascii_uppercase();
+        for (needle, model) in KNOWN_PRINTERS {
+            if upper.contains(needle) {
+                return Some(*model);
+            }
+        }
+        None
+    }
 }
+
+/// Printer models and their names. The first field is matched
+/// (case-insensitively) against the USB device ID / product string to
+/// pick the model (and with it the dot pitch and head size).
+pub const KNOWN_PRINTERS: &[(&str, Model)] = &[
+    ("SR3700P", Model::Sr3700p),
+    ("SR3900P", Model::Sr3900p),
+    // Verified on hardware: same head and job format as the SR3900P.
+    ("SR750", Model::Sr3900p),
+];
 
 impl std::str::FromStr for Model {
     type Err = String;
@@ -154,12 +179,11 @@ impl TapeWidth {
     /// response; see [`crate::usb::Printer::get_tape_info_raw`] and
     /// `docs/protocol.md` section 1.5), into a [`TapeWidth`].
     ///
-    /// Only indices 1 (6mm), 2 (9mm), 3 (12mm), and 4 (18mm) have been
-    /// confirmed against real hardware. Indices 0 (4mm), 5 (24mm) and 6
-    /// (36mm) are assumed from KING JIM's official tape width lineup for
-    /// this printer line (4/6/9/12/18/24/36/50mm for indices 0..=7).
-    /// Index 7 (50mm) is not representable as a [`TapeWidth`] and
-    /// returns `None`.
+    /// Indices follow KING JIM's published tape lineup for this printer
+    /// line (4/6/9/12/18/24/36/50mm, 0-indexed). Confirmed on hardware:
+    /// 1 = 6mm, 2 = 9mm, 3 = 12mm, 4 = 18mm (by loading the tape and
+    /// running `--detect-tape`). 50mm (would be index 7) is not
+    /// representable as a [`TapeWidth`].
     pub fn from_detected_index(index: u8) -> Option<Self> {
         match index {
             0 => Some(TapeWidth::Mm4),
@@ -370,6 +394,14 @@ mod tests {
     }
 
     #[test]
+    fn model_from_device_name() {
+        assert_eq!(Model::from_device_name("MFG:KING JIM;CMD:ESCPL2;MDL:TEPRA PRO SR3700P;CLS:PRINTER;"), Some(Model::Sr3700p));
+        assert_eq!(Model::from_device_name("TEPRA PRO SR3900P"), Some(Model::Sr3900p));
+        assert_eq!(Model::from_device_name("MDL:TEPRA PRO SR750;"), Some(Model::Sr3900p));
+        assert_eq!(Model::from_device_name("SR5900P"), None);
+    }
+
+    #[test]
     fn model_geometry() {
         assert_eq!(Model::Sr3700p.dpi(), 270.0);
         assert_eq!(Model::Sr3900p.dpi(), 360.0);
@@ -403,7 +435,7 @@ mod tests {
 
     #[test]
     fn from_detected_index_rejects_unsupported_widths() {
-        // Index 7 (50mm) is not implemented.
+        // Index 7 (50mm) is not representable.
         for index in [7, 8, 255] {
             assert_eq!(TapeWidth::from_detected_index(index), None);
         }

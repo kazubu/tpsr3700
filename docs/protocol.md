@@ -136,34 +136,43 @@ width *index*, not the width in mm directly:
 | 12mm        | `08 00 00 03 00 00 00 00`  | 3                |
 | 18mm        | `08 00 00 04 00 00 00 00`  | 4                |
 
-These three index values (1, 3, 4) match exactly the position of each
-width in KING JIM's official TEPRA tape width lineup for this printer
-line, `[4, 6, 9, 12, 18, 24, 36, 50]` mm (0-indexed: 4mm→0, 6mm→1,
-9mm→2, 12mm→3, 18mm→4, 24mm→5, 36mm→6, 50mm→7; per KING JIM's product
-site). This strongly suggests the full mapping is:
+These three index values (1, 3, 4) match the position of each width in
+KING JIM's published tape lineup for this printer line
+(`[4, 6, 9, 12, 18, 24, 36, 50]` mm, 0-indexed), so the full mapping is
+taken to be:
 
-| Index | Tape width |
-|:-----:|-----------:|
-| 0     | 4mm        |
-| 1     | 6mm        |
-| 2     | 9mm        |
-| 3     | 12mm       |
-| 4     | 18mm       |
-| 5     | 24mm       |
-| 6     | 36mm       |
-| 7     | 50mm       |
+| Index | Tape |
+|:-----:|------|
+| 0     | 4mm |
+| 1     | 6mm |
+| 2     | 9mm |
+| 3     | 12mm |
+| 4     | 18mm |
+| 5     | 24mm |
+| 6     | 36mm |
+| 7     | 50mm (named only; the driver cannot print to it) |
 
-Indices 0, 2, 5, 6, and 7 (4mm, 9mm, 24mm, 36mm, 50mm) are extrapolated
-from the lineup pattern and have **not** been confirmed against real
-hardware. The driver maps 2 → 9mm, 5 → 24mm and 6 → 36mm on that basis;
-0 and 7 are rejected.
+Indices 1..=4 are confirmed on hardware (6/12/18mm on an SR3700P, 9mm on
+an SR750, by loading the tape and running `--detect-tape`); the rest are
+from the published lineup. The other 7 bytes are not fully understood;
+byte 0 is a constant `0x08` and byte 1 is an activity state (`00` idle,
+`02` printing, `05` cutting, observed while printing on hardware).
 
-The meaning of the other 7 bytes in the response (always `08 00 00
-<idx> 00 00 00 00` in every observed sample) is unknown; byte 0 (`08`)
-is constant and does not vary with tape width, and might just be an
-echo of `wLength`. No sample with no tape loaded at all has been
-captured, so it's unknown whether/how that case is distinguished from
-a real width index.
+The tape feed operations ("tape feed" / "feed and cut") are plain print
+jobs of blank raster rows, cut per the `C` command; `--feed-mm` sends
+one. A full/half cut also ejects the fixed head-to-cutter lead (~9mm on
+an SR750: a 10mm feed came out as 19mm) as a separate leading scrap, so
+feed-and-cut produces that scrap plus the fed piece; feed without a cut
+to avoid it.
+
+### Identifying the printer
+
+The model is identified by name from the USB printer-class
+`GET_DEVICE_ID` string (`MFG:KING JIM;CMD:ESCPL2;MDL:TEPRA PRO
+SR3700P;CLS:PRINTER;` on the SR3700P, `...MDL:TEPRA PRO SR750;...` on an
+SR750). `--detect-tape` prints that string and the model looked up from
+it (`KNOWN_PRINTERS` in `src/tepra/mod.rs`), and `--model` defaults to
+it.
 
 ### 1.6 Job submission sequence (SR3900P Windows driver)
 

@@ -102,10 +102,9 @@ pub struct Printer {
 
 /// Decoded printer status, from the 8-byte vendor status response (the
 /// same request the "detect tape width" feature uses; see
-/// [`Printer::get_tape_info_raw`]). Byte 1 is the activity state as
-/// observed in a USB capture of the SR3900P Windows driver printing one
-/// label: `0x00` while idle, `0x02` while printing, `0x05` briefly
-/// at the end (cutting?), then `0x00` again.
+/// [`Printer::get_tape_info_raw`]). Byte 1 is the activity state
+/// (observed on hardware: `0x00` idle, `0x02` printing, `0x05` cutting),
+/// and byte 3 is the tape index (see [`crate::tepra::TapeWidth::from_detected_index`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrinterStatus {
     pub raw: [u8; 8],

@@ -113,6 +113,13 @@ struct Args {
     #[arg(long, value_name = "PATH", conflicts_with = "text")]
     labels_file: Option<PathBuf>,
 
+    /// Feed this many millimetres of blank tape instead of printing
+    /// text (cut according to --cut). This is what the official
+    /// driver's "tape feed" / "feed and cut" do: a job of blank raster
+    /// rows. TEXT must be omitted.
+    #[arg(long, value_name = "MM", conflicts_with_all = ["text", "labels_file"])]
+    feed_mm: Option<f32>,
+
     /// USB vendor ID override (hex, e.g. 0d8a). Defaults to the
     /// TEPRA_USB_VID env var, or the SR3700P's 0d8a. Useful for other
     /// TEPRA PRO models such as the SR3900P: find the IDs with `lsusb`
@@ -129,7 +136,9 @@ struct Args {
     /// sr3900p (360 dpi, 384-dot head). Selects the dot pitch used for
     /// every millimetre conversion, the number of head dots each tape
     /// width uses, and a few model-identifying bytes in the job.
-    /// Defaults to the TEPRA_MODEL env var when set.
+    /// Defaults to the TEPRA_MODEL env var when set, otherwise to the
+    /// model named in the printer's USB device ID when the printer is
+    /// opened, otherwise sr3700p.
     #[arg(long)]
     model: Option<Model>,
 
@@ -144,12 +153,15 @@ struct Args {
     /// result as one line of JSON on stdout, and exit. No TEXT argument
     /// is needed in this mode and nothing is printed.
     ///
-    /// Output: {"tape_mm": 18, "index": 4, "supported": true}
+    /// Output: {"tape_mm": 18, "index": 4, "supported": true,
+    /// "device_id": "...", "model": "sr3900p"}
     /// `index` is the raw tape width index reported by the printer
     /// (see docs/protocol.md section 1.5). `supported` is false when the
     /// loaded width isn't supported by this driver (50mm); in
     /// that case `tape_mm` is the nominal width for the index, or null
-    /// if the index itself is unknown. If no printer is found, an error
+    /// if the index itself is unknown. `device_id` is the USB printer
+    /// class device ID string and `model` is looked up from the model
+    /// name in it (null when unknown). If no printer is found, an error
     /// naming the vendor/product IDs that were searched for is printed
     /// to stderr and the exit status is non-zero.
     #[arg(long)]
@@ -309,22 +321,13 @@ fn open_printer(args: &Args) -> Result<tpsr3700::usb::Printer> {
 }
 
 /// Nominal tape width in mm for a detected tape width index, per the
-/// index mapping in docs/protocol.md section 1.5
-/// (`[4, 6, 9, 12, 18, 24, 36, 50]` mm for indices 0..=7). Returns
-/// `None` for indices outside that table. This exists so widths the
-/// driver cannot print to (50mm) can still be reported
-/// by name in `--detect-tape` output.
+/// published tape lineup (docs/protocol.md section 1.5): index 7 is
+/// 50mm, which the driver cannot print to but can still name; every
+/// other index maps to a supported width.
 fn nominal_mm_for_detected_index(index: u8) -> Option<u8> {
     match index {
-        0 => Some(4),
-        1 => Some(6),
-        2 => Some(9),
-        3 => Some(12),
-        4 => Some(18),
-        5 => Some(24),
-        6 => Some(36),
         7 => Some(50),
-        _ => None,
+        other => TapeWidth::from_detected_index(other).map(|w| w.width_mm()),
     }
 }
 
@@ -332,7 +335,31 @@ fn nominal_mm_for_detected_index(index: u8) -> Option<u8> {
 /// `{"tape_mm": 18, "index": 4, "supported": true}`. For unsupported
 /// widths `tape_mm` falls back to the nominal width for the index
 /// (or `null` when the index is unknown).
+#[cfg(test)]
 fn detect_tape_json(detected: Option<TapeWidth>, index: u8) -> String {
+    detect_json(detected, index, None)
+}
+
+/// Minimal JSON string escaping for the device ID field.
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// `--detect-tape` output with the printer identification: the USB
+/// device ID string and the driver model looked up from the model name
+/// in it (null when unknown).
+fn detect_json(detected: Option<TapeWidth>, index: u8, device_id: Option<&str>) -> String {
     let supported = detected.is_some();
     let tape_mm = detected
         .map(|t| t.width_mm())
@@ -340,7 +367,17 @@ fn detect_tape_json(detected: Option<TapeWidth>, index: u8) -> String {
     let tape_mm_json = tape_mm
         .map(|v| v.to_string())
         .unwrap_or_else(|| "null".to_string());
-    format!("{{\"tape_mm\": {tape_mm_json}, \"index\": {index}, \"supported\": {supported}}}")
+    let (id_json, model_json) = match device_id {
+        Some(id) => (
+            json_string(id),
+            Model::from_device_name(id).map(|m| format!("\"{}\"", m.name())).unwrap_or_else(|| "null".into()),
+        ),
+        None => ("null".into(), "null".into()),
+    };
+    format!(
+        "{{\"tape_mm\": {tape_mm_json}, \"index\": {index}, \"supported\": {supported}, \
+         \"device_id\": {id_json}, \"model\": {model_json}}}"
+    )
 }
 
 /// Parse a `--line-ratios` value such as "7,3" into positive floats.
@@ -377,11 +414,14 @@ fn main() -> Result<()> {
     if args.detect_tape {
         let printer = open_printer(&args)?;
         let (detected, index) = printer.get_tape_width_with_index()?;
-        println!("{}", detect_tape_json(detected, index));
+        let device_id = printer.get_device_id().ok();
+        println!("{}", detect_json(detected, index, device_id.as_deref()));
         return Ok(());
     }
 
     let labels: Vec<String> = match &args.labels_file {
+        Some(_) if args.feed_mm.is_some() => unreachable!("clap rejects --feed-mm with --labels-file"),
+        _ if args.feed_mm.is_some() => vec![String::new()],
         Some(path) => {
             let content = std::fs::read_to_string(path)
                 .with_context(|| format!("failed to read --labels-file {}", path.display()))?;
@@ -418,7 +458,24 @@ fn main() -> Result<()> {
             Ok(s) if !s.trim().is_empty() => s
                 .parse::<Model>()
                 .map_err(|e| anyhow::anyhow!("TEPRA_MODEL: {e}"))?,
-            _ => Model::default(),
+            // No explicit model: ask the printer who it is, if we have it open.
+            _ => match printer.as_ref().and_then(|p| p.get_device_id().ok()) {
+                Some(id) => match Model::from_device_name(&id) {
+                    Some(m) => {
+                        eprintln!("printer identifies as {}; using --model {}", id.trim(), m.name());
+                        m
+                    }
+                    None => {
+                        eprintln!(
+                            "warning: unknown printer '{}'; using --model {} (pass --model to override)",
+                            id.trim(),
+                            Model::default().name()
+                        );
+                        Model::default()
+                    }
+                },
+                None => Model::default(),
+            },
         },
     };
 
@@ -484,10 +541,26 @@ fn main() -> Result<()> {
         anyhow::bail!("--copies must be between 1 and 99, got {}", args.copies);
     }
 
-    let rendered: Vec<(Vec<Vec<u8>>, u32)> = labels
-        .iter()
-        .map(|t| render_label(&renderer, &args, tape, line_ratios.as_deref(), t))
-        .collect::<Result<_>>()?;
+    let rendered: Vec<(Vec<Vec<u8>>, u32)> = match args.feed_mm {
+        Some(mm) => {
+            if !(1.0..=500.0).contains(&mm) {
+                anyhow::bail!("--feed-mm must be between 1 and 500, got {mm}");
+            }
+            // A feed is a job of `mm` blank rows. When cutting, the printer
+            // also ejects the fixed head-to-cutter lead (~9mm on an SR750)
+            // as a separate leading scrap, so "feed and cut" always
+            // produces that scrap plus the fed piece — there is no way to
+            // suppress it in the job. Feed exactly `mm` so the fed piece
+            // matches; to avoid the scrap entirely, feed without cutting.
+            let rows = tape.mm_to_rows(mm).max(1) as usize;
+            eprintln!("feeding {mm}mm of blank tape ({rows} rows), cut: {}", args.cut.name());
+            vec![(vec![vec![0u8; tape.bitmap_bytes()]; rows], 0)]
+        }
+        None => labels
+            .iter()
+            .map(|t| render_label(&renderer, &args, tape, line_ratios.as_deref(), t))
+            .collect::<Result<_>>()?,
+    };
     let (rows, margin) = (&rendered[0].0, rendered[0].1);
 
     let job_opts = JobOptions { cut: args.cut, copies: args.copies };
@@ -703,12 +776,12 @@ fn render_label(
 
 #[cfg(test)]
 mod tests {
-    use super::{detect_tape_json, nominal_mm_for_detected_index, parse_line_ratios};
+    use super::{detect_json, detect_tape_json, nominal_mm_for_detected_index, parse_line_ratios};
     use tpsr3700::tepra::TapeWidth;
 
     #[test]
     fn nominal_mm_matches_protocol_table() {
-        // docs/protocol.md section 1.5: [4, 6, 9, 12, 18, 24, 36, 50]
+        // docs/protocol.md section 1.5 (SR3900P driver table)
         assert_eq!(nominal_mm_for_detected_index(0), Some(4));
         assert_eq!(nominal_mm_for_detected_index(1), Some(6));
         assert_eq!(nominal_mm_for_detected_index(2), Some(9));
@@ -717,7 +790,7 @@ mod tests {
         assert_eq!(nominal_mm_for_detected_index(5), Some(24));
         assert_eq!(nominal_mm_for_detected_index(6), Some(36));
         assert_eq!(nominal_mm_for_detected_index(7), Some(50));
-        assert_eq!(nominal_mm_for_detected_index(8), None);
+        assert_eq!(nominal_mm_for_detected_index(11), None);
         assert_eq!(nominal_mm_for_detected_index(255), None);
     }
 
@@ -725,11 +798,15 @@ mod tests {
     fn detect_json_supported_width() {
         assert_eq!(
             detect_tape_json(Some(TapeWidth::Mm18), 4),
-            "{\"tape_mm\": 18, \"index\": 4, \"supported\": true}"
+            "{\"tape_mm\": 18, \"index\": 4, \"supported\": true, \"device_id\": null, \"model\": null}"
         );
         assert_eq!(
-            detect_tape_json(Some(TapeWidth::Mm6), 1),
-            "{\"tape_mm\": 6, \"index\": 1, \"supported\": true}"
+            detect_json(Some(TapeWidth::Mm6), 1, Some("MFG:KING JIM;CMD:ESCPL2;MDL:TEPRA PRO SR750;CLS:PRINTER;")),
+            "{\"tape_mm\": 6, \"index\": 1, \"supported\": true, \"device_id\": \"MFG:KING JIM;CMD:ESCPL2;MDL:TEPRA PRO SR750;CLS:PRINTER;\", \"model\": \"sr3900p\"}"
+        );
+        assert_eq!(
+            detect_json(None, 7, Some("MDL:XYZ \"q\"")),
+            "{\"tape_mm\": 50, \"index\": 7, \"supported\": false, \"device_id\": \"MDL:XYZ \\\"q\\\"\", \"model\": null}"
         );
     }
 
@@ -737,25 +814,25 @@ mod tests {
     fn detect_json_9mm_and_36mm_are_supported() {
         assert_eq!(
             detect_tape_json(Some(TapeWidth::Mm9), 2),
-            "{\"tape_mm\": 9, \"index\": 2, \"supported\": true}"
+            "{\"tape_mm\": 9, \"index\": 2, \"supported\": true, \"device_id\": null, \"model\": null}"
         );
         assert_eq!(
             detect_tape_json(Some(TapeWidth::Mm36), 6),
-            "{\"tape_mm\": 36, \"index\": 6, \"supported\": true}"
+            "{\"tape_mm\": 36, \"index\": 6, \"supported\": true, \"device_id\": null, \"model\": null}"
         );
     }
 
     #[test]
     fn detect_json_unsupported_width_reports_nominal_mm() {
-        // 50mm (index 7) is a real width the driver cannot print to; it
-        // must still be reported by name.
+        // 4mm is index 11 in the driver's table.
         assert_eq!(
             detect_tape_json(Some(TapeWidth::Mm4), 0),
-            "{\"tape_mm\": 4, \"index\": 0, \"supported\": true}"
+            "{\"tape_mm\": 4, \"index\": 0, \"supported\": true, \"device_id\": null, \"model\": null}"
         );
+        // 50mm (index 7) is named but not printable.
         assert_eq!(
             detect_tape_json(None, 7),
-            "{\"tape_mm\": 50, \"index\": 7, \"supported\": false}"
+            "{\"tape_mm\": 50, \"index\": 7, \"supported\": false, \"device_id\": null, \"model\": null}"
         );
     }
 
@@ -763,7 +840,7 @@ mod tests {
     fn detect_json_unknown_index_reports_null() {
         assert_eq!(
             detect_tape_json(None, 9),
-            "{\"tape_mm\": null, \"index\": 9, \"supported\": false}"
+            "{\"tape_mm\": null, \"index\": 9, \"supported\": false, \"device_id\": null, \"model\": null}"
         );
     }
 
