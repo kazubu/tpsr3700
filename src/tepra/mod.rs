@@ -179,20 +179,21 @@ impl TapeWidth {
     /// response; see [`crate::usb::Printer::get_tape_info_raw`] and
     /// `docs/protocol.md` section 1.5), into a [`TapeWidth`].
     ///
-    /// Indices follow KING JIM's published tape lineup for this printer
-    /// line (4/6/9/12/18/24/36/50mm, 0-indexed). Confirmed on hardware:
-    /// 1 = 6mm, 2 = 9mm, 3 = 12mm, 4 = 18mm (by loading the tape and
-    /// running `--detect-tape`). 50mm (would be index 7) is not
-    /// representable as a [`TapeWidth`].
+    /// Confirmed on hardware by loading each tape and running
+    /// `--detect-tape`: 0 = no tape loaded, 1 = 6mm, 2 = 9mm, 3 = 12mm,
+    /// 4 = 18mm, 11 = 4mm. 5 = 24mm and 6 = 36mm continue the 6..36mm
+    /// run and are assumed. Note that 4mm sits at 11, not at 0, so the
+    /// indices are not simply positions in the published width lineup.
     pub fn from_detected_index(index: u8) -> Option<Self> {
         match index {
-            0 => Some(TapeWidth::Mm4),
             1 => Some(TapeWidth::Mm6),
             2 => Some(TapeWidth::Mm9),
             3 => Some(TapeWidth::Mm12),
             4 => Some(TapeWidth::Mm18),
             5 => Some(TapeWidth::Mm24),
             6 => Some(TapeWidth::Mm36),
+            11 => Some(TapeWidth::Mm4),
+            // 0 = no tape loaded; anything else is unknown.
             _ => None,
         }
     }
@@ -426,17 +427,18 @@ mod tests {
     }
 
     #[test]
-    fn from_detected_index_maps_lineup_widths() {
-        assert_eq!(TapeWidth::from_detected_index(0), Some(TapeWidth::Mm4));
+    fn from_detected_index_maps_remaining_widths() {
+        // 11 = 4mm and 0 = no tape, both confirmed on hardware.
+        assert_eq!(TapeWidth::from_detected_index(11), Some(TapeWidth::Mm4));
         assert_eq!(TapeWidth::from_detected_index(2), Some(TapeWidth::Mm9));
         assert_eq!(TapeWidth::from_detected_index(5), Some(TapeWidth::Mm24));
         assert_eq!(TapeWidth::from_detected_index(6), Some(TapeWidth::Mm36));
     }
 
     #[test]
-    fn from_detected_index_rejects_unsupported_widths() {
-        // Index 7 (50mm) is not representable.
-        for index in [7, 8, 255] {
+    fn from_detected_index_rejects_no_tape_and_unknown() {
+        // 0 = no tape loaded; the rest are not known to mean a width.
+        for index in [0, 7, 8, 255] {
             assert_eq!(TapeWidth::from_detected_index(index), None);
         }
     }

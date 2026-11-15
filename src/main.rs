@@ -320,15 +320,11 @@ fn open_printer(args: &Args) -> Result<tpsr3700::usb::Printer> {
     }
 }
 
-/// Nominal tape width in mm for a detected tape width index, per the
-/// published tape lineup (docs/protocol.md section 1.5): index 7 is
-/// 50mm, which the driver cannot print to but can still name; every
-/// other index maps to a supported width.
+/// Nominal tape width in mm for a detected tape width index
+/// (docs/protocol.md section 1.5). `None` for index 0 (no tape) and for
+/// indices whose meaning is unknown.
 fn nominal_mm_for_detected_index(index: u8) -> Option<u8> {
-    match index {
-        7 => Some(50),
-        other => TapeWidth::from_detected_index(other).map(|w| w.width_mm()),
-    }
+    TapeWidth::from_detected_index(index).map(|w| w.width_mm())
 }
 
 /// Formats the `--detect-tape` result as one line of JSON:
@@ -781,16 +777,17 @@ mod tests {
 
     #[test]
     fn nominal_mm_matches_protocol_table() {
-        // docs/protocol.md section 1.5 (SR3900P driver table)
-        assert_eq!(nominal_mm_for_detected_index(0), Some(4));
+        // docs/protocol.md section 1.5
         assert_eq!(nominal_mm_for_detected_index(1), Some(6));
         assert_eq!(nominal_mm_for_detected_index(2), Some(9));
         assert_eq!(nominal_mm_for_detected_index(3), Some(12));
         assert_eq!(nominal_mm_for_detected_index(4), Some(18));
         assert_eq!(nominal_mm_for_detected_index(5), Some(24));
         assert_eq!(nominal_mm_for_detected_index(6), Some(36));
-        assert_eq!(nominal_mm_for_detected_index(7), Some(50));
-        assert_eq!(nominal_mm_for_detected_index(11), None);
+        assert_eq!(nominal_mm_for_detected_index(11), Some(4));
+        // 0 = no tape loaded.
+        assert_eq!(nominal_mm_for_detected_index(0), None);
+        assert_eq!(nominal_mm_for_detected_index(7), None);
         assert_eq!(nominal_mm_for_detected_index(255), None);
     }
 
@@ -806,7 +803,7 @@ mod tests {
         );
         assert_eq!(
             detect_json(None, 7, Some("MDL:XYZ \"q\"")),
-            "{\"tape_mm\": 50, \"index\": 7, \"supported\": false, \"device_id\": \"MDL:XYZ \\\"q\\\"\", \"model\": null}"
+            "{\"tape_mm\": null, \"index\": 7, \"supported\": false, \"device_id\": \"MDL:XYZ \\\"q\\\"\", \"model\": null}"
         );
     }
 
@@ -823,16 +820,16 @@ mod tests {
     }
 
     #[test]
-    fn detect_json_unsupported_width_reports_nominal_mm() {
-        // 4mm is index 11 in the driver's table.
+    fn detect_json_reports_4mm_and_no_tape() {
+        // 4mm is index 11, confirmed on hardware.
         assert_eq!(
-            detect_tape_json(Some(TapeWidth::Mm4), 0),
-            "{\"tape_mm\": 4, \"index\": 0, \"supported\": true, \"device_id\": null, \"model\": null}"
+            detect_tape_json(Some(TapeWidth::Mm4), 11),
+            "{\"tape_mm\": 4, \"index\": 11, \"supported\": true, \"device_id\": null, \"model\": null}"
         );
-        // 50mm (index 7) is named but not printable.
+        // 0 = no tape loaded.
         assert_eq!(
-            detect_tape_json(None, 7),
-            "{\"tape_mm\": 50, \"index\": 7, \"supported\": false, \"device_id\": null, \"model\": null}"
+            detect_tape_json(None, 0),
+            "{\"tape_mm\": null, \"index\": 0, \"supported\": false, \"device_id\": null, \"model\": null}"
         );
     }
 

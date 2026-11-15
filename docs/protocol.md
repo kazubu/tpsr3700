@@ -136,25 +136,25 @@ width *index*, not the width in mm directly:
 | 12mm        | `08 00 00 03 00 00 00 00`  | 3                |
 | 18mm        | `08 00 00 04 00 00 00 00`  | 4                |
 
-These three index values (1, 3, 4) match the position of each width in
-KING JIM's published tape lineup for this printer line
-(`[4, 6, 9, 12, 18, 24, 36, 50]` mm, 0-indexed), so the full mapping is
-taken to be:
+The mapping, established by loading each tape and running
+`--detect-tape`:
 
 | Index | Tape |
 |:-----:|------|
-| 0     | 4mm |
+| 0     | no tape loaded |
 | 1     | 6mm |
 | 2     | 9mm |
 | 3     | 12mm |
 | 4     | 18mm |
 | 5     | 24mm |
 | 6     | 36mm |
-| 7     | 50mm (named only; the driver cannot print to it) |
+| 11    | 4mm |
 
-Indices 1..=4 are confirmed on hardware (6/12/18mm on an SR3700P, 9mm on
-an SR750, by loading the tape and running `--detect-tape`); the rest are
-from the published lineup. The other 7 bytes are not fully understood;
+Confirmed on hardware: 0, 1, 2, 3, 4 and 11 (6/12/18mm on an SR3700P;
+no tape, 9mm and 4mm on an SR750). 5 and 6 continue the 6..36mm run and
+are assumed. Note that 4mm sits at 11, not at 0, so the indices are not
+simply positions in KING JIM's published width lineup; no index is known
+to mean 50mm. The other 7 bytes are not fully understood;
 byte 0 is a constant `0x08` and byte 1 is an activity state (`00` idle,
 `02` printing, `05` cutting, observed while printing on hardware).
 
