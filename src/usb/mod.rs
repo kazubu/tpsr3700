@@ -94,9 +94,37 @@ pub fn find_device_with(vid: u16, pid: u16) -> Result<Device<GlobalContext>> {
 /// An open connection to the printer's bulk endpoints.
 pub struct Printer {
     handle: DeviceHandle<GlobalContext>,
+    interface: u8,
     endpoint_out: u8,
     #[allow(dead_code)]
     endpoint_in: u8,
+}
+
+/// Decoded printer status, from the 8-byte vendor status response (the
+/// same request the "detect tape width" feature uses; see
+/// [`Printer::get_tape_info_raw`]). Byte 1 is the activity state as
+/// observed in a USB capture of the SR3900P Windows driver printing one
+/// label: `0x00` while idle, `0x02` while printing, `0x05` briefly
+/// at the end (cutting?), then `0x00` again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrinterStatus {
+    pub raw: [u8; 8],
+}
+
+impl PrinterStatus {
+    /// Activity byte (byte 1): 0 = idle.
+    pub fn activity(&self) -> u8 {
+        self.raw[1]
+    }
+
+    pub fn is_idle(&self) -> bool {
+        self.activity() == 0
+    }
+
+    /// Tape width index (byte 3); see `TapeWidth::from_detected_index`.
+    pub fn tape_index(&self) -> u8 {
+        self.raw[3]
+    }
 }
 
 impl Printer {
@@ -181,6 +209,7 @@ impl Printer {
 
         Ok(Self {
             handle,
+            interface: interface.number(),
             endpoint_out,
             endpoint_in,
         })
@@ -250,8 +279,59 @@ impl Printer {
         Ok((crate::tepra::TapeWidth::from_detected_index(index), index))
     }
 
-    /// Sends a raw TEPRA print job byte stream directly to the printer's
-    /// bulk OUT endpoint, with no additional framing.
+    /// Reads the printer's 8-byte status (same request as
+    /// [`Self::get_tape_info_raw`]).
+    pub fn get_status(&self) -> Result<PrinterStatus> {
+        Ok(PrinterStatus { raw: self.get_tape_info_raw()? })
+    }
+
+    /// USB Printer Class SOFT_RESET (bmRequestType 0x21, bRequest 2) to
+    /// the printer interface. The SR3900P Windows driver issues this
+    /// right before every job (see `docs/protocol.md` section 1.6).
+    pub fn soft_reset(&self) -> Result<()> {
+        self.handle
+            .write_control(0x21, 2, 0, self.interface as u16, &[], Duration::from_secs(3))
+            .context("SOFT_RESET failed")?;
+        Ok(())
+    }
+
+    /// Polls the printer status every 500ms (as the Windows driver does)
+    /// until the printer has gone busy and idle again, calling
+    /// `on_change` with every distinct status seen. Gives up after
+    /// `timeout`. If the printer never reports busy within the first
+    /// `grace` period it is assumed to have finished (or ignored the
+    /// job) and the function returns.
+    pub fn wait_until_idle(
+        &self,
+        timeout: Duration,
+        grace: Duration,
+        mut on_change: impl FnMut(PrinterStatus),
+    ) -> Result<PrinterStatus> {
+        let start = std::time::Instant::now();
+        let mut last: Option<PrinterStatus> = None;
+        let mut seen_busy = false;
+        loop {
+            let st = self.get_status()?;
+            if last != Some(st) {
+                on_change(st);
+                last = Some(st);
+            }
+            if !st.is_idle() {
+                seen_busy = true;
+            } else if seen_busy || start.elapsed() >= grace {
+                return Ok(st);
+            }
+            if start.elapsed() >= timeout {
+                bail!("printer still busy after {:?} (status {:02x?})", timeout, st.raw);
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    /// Sends a raw byte stream directly to the printer's bulk OUT
+    /// endpoint, with no additional framing. Callers normally pass
+    /// [`crate::tepra::builder::printer_payload`] of a job rather than
+    /// the whole job (see there).
     pub fn send_job(&mut self, job: &[u8]) -> Result<()> {
         let mut sent = 0;
         while sent < job.len() {
@@ -265,5 +345,16 @@ impl Printer {
             sent += n;
         }
         Ok(())
+    }
+
+    /// USB Printer Class GET_PORT_STATUS (bmRequestType 0xA1, bRequest
+    /// 1): one status byte (`0x18` = selected, paper not empty). The
+    /// Windows class driver reads it after SOFT_RESET.
+    pub fn get_port_status(&self) -> Result<u8> {
+        let mut buf = [0u8; 1];
+        self.handle
+            .read_control(0xA1, 1, 0, self.interface as u16, &mut buf, Duration::from_secs(3))
+            .context("GET_PORT_STATUS failed")?;
+        Ok(buf[0])
     }
 }

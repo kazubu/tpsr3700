@@ -5,6 +5,8 @@
 //! user to confirm in the terminal before printing. This avoids depending on
 //! GPU-backed GUI textures while still showing the exact raster data.
 
+use crate::tepra::Tape;
+#[cfg(test)]
 use crate::tepra::TapeWidth;
 use anyhow::{Context, Result};
 use std::fmt::Write as _;
@@ -41,7 +43,7 @@ pub enum PreviewResult {
 /// it from the printable area.
 pub fn show_preview(
     rows: &[Vec<u8>],
-    tape: TapeWidth,
+    tape: Tape,
     label_text: &str,
     top_margin_bits: usize,
     bottom_margin_bits: usize,
@@ -78,7 +80,7 @@ pub fn show_preview(
 /// [`show_preview`] displays can be saved or served over HTTP.
 pub fn build_svg_preview(
     rows: &[Vec<u8>],
-    tape: TapeWidth,
+    tape: Tape,
     label_text: &str,
     top_margin_bits: usize,
     bottom_margin_bits: usize,
@@ -95,7 +97,18 @@ pub fn build_svg_preview(
     let content_end = feed_len.saturating_sub(right_margin_rows);
     let title = escape_xml(label_text);
     let display_width = feed_len.max(1);
-    let display_height = total_bits.max(1);
+
+    // Draw the whole tape, not just the dot band: the physical tape is
+    // wider than the head dots it uses (e.g. 9mm tape prints 7.9mm), and
+    // every part of the label that gets no ink is hatched so it reads as
+    // "label, but not printed" rather than as a gap.
+    let tape_rows = (tape.mm_to_rows(tape.width_mm() as f32) as usize).max(total_bits);
+    let band_offset = (tape_rows - total_bits) / 2;
+    let display_height = tape_rows.max(1);
+    // Non-printing bands in tape coordinates (y grows downwards; bit 0 of
+    // a row is the bottom edge of the dot band).
+    let hatch_top = band_offset + (total_bits - head_end);
+    let hatch_bottom_y = band_offset + (total_bits - head_offset);
 
     let mut svg = String::new();
     let _ = writeln!(
@@ -103,25 +116,36 @@ pub fn build_svg_preview(
         r#"<svg xmlns="http://www.w3.org/2000/svg" width="{display_width}" height="{display_height}" viewBox="0 0 {display_width} {display_height}" shape-rendering="crispEdges">"#
     );
     let _ = writeln!(svg, "<title>{title}</title>");
+    let _ = writeln!(
+        svg,
+        r##"<defs><pattern id="hatch" patternUnits="userSpaceOnUse" width="8" height="8" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="8" stroke="#b8b8b8" stroke-width="1.5"/></pattern></defs>"##
+    );
     let _ = writeln!(svg, r#"<rect width="100%" height="100%" fill="white"/>"#);
 
-    if head_end < total_bits {
-        let _ = writeln!(svg, r##"<rect x="0" y="0" width="{feed_len}" height="{}" fill="#e0e0e0"/>"##, total_bits - head_end);
+    // Tape edges above/below the printable band (includes the tape area
+    // the head cannot reach and the configured top/bottom margins).
+    if hatch_top > 0 {
+        let _ = writeln!(svg, r##"<rect class="margin" x="0" y="0" width="{feed_len}" height="{hatch_top}" fill="url(#hatch)"/>"##);
     }
-    if head_offset > 0 {
-        let y = total_bits - head_offset;
-        let _ = writeln!(svg, r##"<rect x="0" y="{y}" width="{feed_len}" height="{head_offset}" fill="#e0e0e0"/>"##);
+    if hatch_bottom_y < tape_rows {
+        let h = tape_rows - hatch_bottom_y;
+        let _ = writeln!(svg, r##"<rect class="margin" x="0" y="{hatch_bottom_y}" width="{feed_len}" height="{h}" fill="url(#hatch)"/>"##);
     }
+    // Blank feed margins before and after the content.
     if left_margin_rows > 0 {
-        let _ = writeln!(svg, r##"<rect x="0" y="0" width="{left_margin_rows}" height="{total_bits}" fill="#e0e0e0"/>"##);
+        let _ = writeln!(svg, r##"<rect class="margin" x="0" y="0" width="{left_margin_rows}" height="{tape_rows}" fill="url(#hatch)"/>"##);
     }
     if right_margin_rows > 0 {
         let x = content_end;
-        let _ = writeln!(svg, r##"<rect x="{x}" y="0" width="{right_margin_rows}" height="{total_bits}" fill="#e0e0e0"/>"##);
+        let _ = writeln!(svg, r##"<rect class="margin" x="{x}" y="0" width="{right_margin_rows}" height="{tape_rows}" fill="url(#hatch)"/>"##);
     }
 
-    let _ = writeln!(svg, r#"<path fill="black" d="{}"/>"#, ink_path(rows, total_bits));
-    let _ = writeln!(svg, r##"<rect x="0" y="0" width="{feed_len}" height="{total_bits}" fill="none" stroke="#808080" stroke-width="1" vector-effect="non-scaling-stroke"/>"##);
+    let _ = writeln!(
+        svg,
+        r#"<path fill="black" transform="translate(0 {band_offset})" d="{}"/>"#,
+        ink_path(rows, total_bits)
+    );
+    let _ = writeln!(svg, r##"<rect x="0" y="0" width="{feed_len}" height="{tape_rows}" fill="none" stroke="#808080" stroke-width="1" vector-effect="non-scaling-stroke"/>"##);
     let _ = writeln!(svg, "</svg>");
     svg
 }
@@ -234,9 +258,15 @@ mod tests {
     #[test]
     fn svg_contains_margin_and_ink() {
         let rows = vec![vec![0b0100_0000], vec![0]];
-        let svg = build_svg_preview(&rows, TapeWidth::Mm6, "A&B", 1, 1, 1, 0);
+        let svg = build_svg_preview(&rows, Tape::sr3700p(TapeWidth::Mm6), "A&B", 1, 1, 1, 0);
         assert!(svg.contains("A&amp;B"));
-        assert!(svg.contains("#e0e0e0"));
-        assert!(svg.contains(r#"<path fill="black" d="M0 62h1v1h-1z"/>"#));
+        // Margins are hatched, not grey.
+        assert!(svg.contains(r##"fill="url(#hatch)""##));
+        assert!(!svg.contains("#e0e0e0"));
+        // 6mm tape is 64 rows tall at 270 dpi and the 56-dot band sits in
+        // the middle (offset 4); bit 1 (MSB-first) is drawn at y = 56 - 1 - 1
+        // within the band.
+        assert!(svg.contains(r#"height="64""#));
+        assert!(svg.contains(r#"<path fill="black" transform="translate(0 4)" d="M0 54h1v1h-1z"/>"#));
     }
 }

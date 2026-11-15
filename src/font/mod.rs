@@ -7,6 +7,8 @@
 //! the usual way and mapping (x, y) -> (row, bit) produces correctly
 //! oriented output, confirmed against captured "A"/"B" print jobs.
 
+use crate::tepra::{Model, Tape};
+#[cfg(test)]
 use crate::tepra::TapeWidth;
 use anyhow::{Context, Result};
 
@@ -20,14 +22,34 @@ pub const DEFAULT_FONT_BYTES: &[u8] =
 /// `T` command's margin value in captured jobs) into fontdue's
 /// pixels-per-em `px` parameter.
 ///
-/// Derived from a captured 36pt "A" on 18mm tape: fontdue's rasterized
-/// glyph width (feed direction) matched the captured bitmap's column span
-/// (63 dots) exactly at `px = 104.0`, giving `104 / 36 * 72 = 208` dpi.
-const DOTS_PER_INCH: f32 = 208.0;
+/// How the TEPRA desktop app's point sizes map to dots: an em of `pt`
+/// points is rendered `pt * APP_PT_SCALE * dpi / 72` dots tall, i.e. the
+/// app's "point" is 1.1 real points. Measured from the half-width
+/// character pitch (exactly 0.5 em in MS Gothic) in two captures:
+///
+/// - SR3700P driver, 36pt "AA" (`tests/fixtures/aa.prn`): pitch 74 rows
+///   at 270 dpi → em 148 dots = 36pt × 4.11 → factor 1.097.
+/// - SR3900P driver, MS Gothic 16pt "TEST 123"
+///   (`tests/fixtures/sr3900p-w9-full.prn` etc.): pitch 43.8 rows at
+///   360 dpi → em 87.6 dots = 16pt × 5.47 → factor 1.095.
+///
+/// The cap height in those captures (104 and 61 dots) is 0.70 em, which
+/// matches MS Gothic. Upstream used 208 "dpi" (2.89 dots/pt on the
+/// SR3700P) from matching BIZ UDPGothic's wider "A" to the capture; that
+/// made the same point size print ~30% smaller than the app.
+const APP_PT_SCALE: f32 = 1.1;
 
-/// Default feed-direction margin (in millimeters) added before and after
-/// the printed content, matching the TEPRA desktop app's default margin
-/// setting.
+/// Default blank feed margins (in millimeters) before and after the
+/// printed content. On an SR3900P, equal data margins print with the
+/// left (leading) margin visibly shorter, so the left default is 1mm
+/// larger; 4mm / 3mm was chosen by printing and comparing. (Upstream's
+/// defaults were 10mm / 3mm. For reference, the SR3900P driver captures
+/// with the app's default margin setting carry 48 blank rows (3.4mm)
+/// before the first ink and 66 (4.7mm) after it.)
+pub const DEFAULT_LEFT_MARGIN_MM: f32 = 4.0;
+pub const DEFAULT_RIGHT_MARGIN_MM: f32 = 3.0;
+
+/// Symmetric margin used by the renderer tests.
 pub const DEFAULT_FEED_MARGIN_MM: f32 = 3.0;
 
 /// Minimum height of a single printed line in millimeters.
@@ -58,26 +80,22 @@ impl std::str::FromStr for TextAlign {
     }
 }
 
-/// Converts a length in millimeters to a number of raster rows (feed
-/// direction dots), using [`DOTS_PER_INCH`].
-///
-/// This assumes the feed direction has the same dot density as the tape
-/// width direction (from which `DOTS_PER_INCH` was derived); this has not
-/// been independently verified and may not be exactly correct, but is the
-/// best available estimate absent a captured multi-row-margin sample to
-/// calibrate against directly.
-pub fn mm_to_rows(mm: f32) -> u32 {
-    (mm / 25.4 * DOTS_PER_INCH).round() as u32
+/// Dots per "inch" of TEPRA point size for `model` (see
+/// [`APP_PT_SCALE`]).
+fn app_pt_dots_per_inch(model: Model) -> f32 {
+    APP_PT_SCALE * model.dpi()
 }
 
-/// Converts a point size into fontdue's `px` (pixels-per-em) parameter.
-fn pt_to_px(pt: f32) -> f32 {
-    pt * DOTS_PER_INCH / 72.0
+/// Converts a TEPRA point size into fontdue's `px` (pixels-per-em)
+/// parameter for `model`'s dot pitch.
+fn pt_to_px(pt: f32, model: Model) -> f32 {
+    pt * app_pt_dots_per_inch(model) / 72.0
 }
 
-/// Converts fontdue's `px` (pixels-per-em) parameter into a point size.
-fn px_to_pt(px: f32) -> f32 {
-    px * 72.0 / DOTS_PER_INCH
+/// Converts fontdue's `px` (pixels-per-em) parameter for `model`'s dot
+/// pitch into a TEPRA point size.
+fn px_to_pt(px: f32, model: Model) -> f32 {
+    px * 72.0 / app_pt_dots_per_inch(model)
 }
 
 /// A loaded font, ready to rasterize text into TEPRA raster rows.
@@ -122,7 +140,7 @@ impl FontRenderer {
     /// each).
     pub fn max_size_pt_for_tape(
         &self,
-        tape: TapeWidth,
+        tape: Tape,
         top_margin_bits: usize,
         bottom_margin_bits: usize,
     ) -> f32 {
@@ -132,7 +150,7 @@ impl FontRenderer {
             .saturating_sub(top_margin_bits + bottom_margin_bits)
             .max(1);
         let max_px = head_bits as f32 / ratio_per_px;
-        px_to_pt(max_px)
+        px_to_pt(max_px, tape.model)
     }
 
     /// Returns `true` if rendering at `size_pt` would clip the top or
@@ -145,11 +163,11 @@ impl FontRenderer {
     pub fn would_clip(
         &self,
         size_pt: f32,
-        tape: TapeWidth,
+        tape: Tape,
         top_margin_bits: usize,
         bottom_margin_bits: usize,
     ) -> bool {
-        let size_px = pt_to_px(size_pt);
+        let size_px = pt_to_px(size_pt, tape.model);
         let head_bits = tape
             .bitmap_bits()
             .saturating_sub(top_margin_bits + bottom_margin_bits)
@@ -289,6 +307,17 @@ impl FontRenderer {
         }
     }
 
+    /// Horizontal (feed-direction) offset of a line of `line_width_dots`
+    /// within a `content_dots`-wide block for `align`.
+    fn h_offset_for(align: TextAlign, content_dots: usize, line_width_dots: usize) -> usize {
+        let slack = content_dots.saturating_sub(line_width_dots);
+        match align {
+            TextAlign::Left => 0,
+            TextAlign::Center => slack / 2,
+            TextAlign::Right => slack,
+        }
+    }
+
     /// Render `text` at the given point size (matching the size shown in
     /// the TEPRA desktop app, e.g. 36pt) into a sequence of TEPRA raster
     /// rows for the given tape width, with `left_margin_mm` / `right_margin_mm`
@@ -297,7 +326,8 @@ impl FontRenderer {
     ///
     /// If `text` contains `'\n'` characters the text is split into lines and
     /// each line is rendered into an equal vertical band, matching the
-    /// behaviour of [`render_text_multiline`] but without a fixed tape length.
+    /// behaviour of [`render_text_multiline`] but without a fixed tape
+    /// length; lines are left-aligned (see [`render_text_aligned`]).
     ///
     /// Returns `(rows, margin_rows)` where `margin_rows` is the number of
     /// leading (left) blank rows (matching the `T` command semantics).
@@ -305,13 +335,31 @@ impl FontRenderer {
         &self,
         text: &str,
         size_pt: f32,
-        tape: TapeWidth,
+        tape: Tape,
         left_margin_mm: f32,
         right_margin_mm: f32,
         top_margin_bits: usize,
         bottom_margin_bits: usize,
     ) -> (Vec<Vec<u8>>, u32) {
-        let size_px = pt_to_px(size_pt);
+        self.render_text_aligned(text, size_pt, tape, left_margin_mm, right_margin_mm, top_margin_bits, bottom_margin_bits, TextAlign::Left)
+    }
+
+    /// Same as [`render_text`], aligning each line of a multi-line text
+    /// within the widest line according to `align` (the label is as long
+    /// as the widest line, so alignment has no effect on single-line
+    /// text).
+    pub fn render_text_aligned(
+        &self,
+        text: &str,
+        size_pt: f32,
+        tape: Tape,
+        left_margin_mm: f32,
+        right_margin_mm: f32,
+        top_margin_bits: usize,
+        bottom_margin_bits: usize,
+        align: TextAlign,
+    ) -> (Vec<Vec<u8>>, u32) {
+        let size_px = pt_to_px(size_pt, tape.model);
         let total_bits = tape.bitmap_bits();
         let head_bits = tape
             .bitmap_bits()
@@ -341,7 +389,7 @@ impl FontRenderer {
 
             let mut merged: Vec<Vec<bool>> = vec![vec![false; total_bits]; max_width];
 
-            for (line_idx, (fb, _advance)) in rasterized.iter().enumerate() {
+            for (line_idx, (fb, advance)) in rasterized.iter().enumerate() {
                 let band_start = line_idx * band_head_bits;
                 let ink_h = Self::ink_height(fb);
                 let ink_top = Self::ink_top(fb);
@@ -352,6 +400,7 @@ impl FontRenderer {
                 };
                 let bit_start_signed =
                     band_start as isize + v_offset as isize - ink_top as isize;
+                let h_offset = Self::h_offset_for(align, max_width, advance.ceil() as usize);
 
                 Self::place_framebuf_at(
                     fb,
@@ -362,7 +411,7 @@ impl FontRenderer {
                     bit_start_signed,
                     band_start,
                     band_head_bits,
-                    0,
+                    h_offset,
                     max_width,
                 );
             }
@@ -378,8 +427,8 @@ impl FontRenderer {
                 (Some(first), Some(last)) => rows[first..=last].to_vec(),
                 _ => Vec::new(),
             };
-            let left_rows = mm_to_rows(left_margin_mm);
-            let right_rows = mm_to_rows(right_margin_mm);
+            let left_rows = tape.mm_to_rows(left_margin_mm);
+            let right_rows = tape.mm_to_rows(right_margin_mm);
             let blank_row = vec![0u8; tape.bitmap_bytes()];
             let mut padded = Vec::with_capacity(
                 trimmed.len() + left_rows as usize + right_rows as usize,
@@ -461,8 +510,8 @@ impl FontRenderer {
             _ => Vec::new(),
         };
 
-        let left_rows = mm_to_rows(left_margin_mm);
-        let right_rows = mm_to_rows(right_margin_mm);
+        let left_rows = tape.mm_to_rows(left_margin_mm);
+        let right_rows = tape.mm_to_rows(right_margin_mm);
         let blank_row = vec![0u8; tape.bitmap_bytes()];
 
         let mut padded = Vec::with_capacity(trimmed.len() + left_rows as usize + right_rows as usize);
@@ -527,7 +576,7 @@ impl FontRenderer {
         &self,
         size_pt: Option<f32>,
         ratios: &[f32],
-        tape: TapeWidth,
+        tape: Tape,
         top_margin_bits: usize,
         bottom_margin_bits: usize,
     ) -> Vec<f32> {
@@ -561,11 +610,32 @@ impl FontRenderer {
         text: &str,
         size_pt: Option<f32>,
         line_ratios: &[f32],
-        tape: TapeWidth,
+        tape: Tape,
         left_margin_mm: f32,
         right_margin_mm: f32,
         top_margin_bits: usize,
         bottom_margin_bits: usize,
+    ) -> Result<(Vec<Vec<u8>>, u32)> {
+        self.render_text_ratios_aligned(text, size_pt, line_ratios, tape, left_margin_mm, right_margin_mm, top_margin_bits, bottom_margin_bits, TextAlign::Left, None)
+    }
+
+    /// Same as [`render_text_ratios`], aligning each line according to
+    /// `align` within the widest line, or — when `fixed_length_mm` is
+    /// given — within a label of exactly that length (margins included).
+    /// With a fixed length the text is never wrapped: if the widest line
+    /// does not fit between the margins this returns an error.
+    pub fn render_text_ratios_aligned(
+        &self,
+        text: &str,
+        size_pt: Option<f32>,
+        line_ratios: &[f32],
+        tape: Tape,
+        left_margin_mm: f32,
+        right_margin_mm: f32,
+        top_margin_bits: usize,
+        bottom_margin_bits: usize,
+        align: TextAlign,
+        fixed_length_mm: Option<f32>,
     ) -> Result<(Vec<Vec<u8>>, u32)> {
         Self::validate_line_ratios(line_ratios)?;
 
@@ -586,8 +656,9 @@ impl FontRenderer {
             );
         }
 
-        // Single line: ratios carry no information (share is 1.0).
-        if line_strs.len() == 1 {
+        // Single line: ratios carry no information (share is 1.0). (With a
+        // fixed length fall through so the length and alignment apply.)
+        if line_strs.len() == 1 && fixed_length_mm.is_none() {
             let size = size_pt
                 .unwrap_or_else(|| self.max_size_pt_for_tape(tape, top_margin_bits, bottom_margin_bits));
             return Ok(self.render_text(
@@ -621,7 +692,7 @@ impl FontRenderer {
         let rasterized: Vec<(Vec<Vec<bool>>, f32)> = line_strs
             .iter()
             .zip(&sizes)
-            .map(|(s, &pt)| self.rasterize_line(s, pt_to_px(pt)))
+            .map(|(s, &pt)| self.rasterize_line(s, pt_to_px(pt, tape.model)))
             .collect();
 
         let max_width = rasterized
@@ -631,9 +702,38 @@ impl FontRenderer {
             .unwrap_or(1)
             .max(1);
 
-        let mut merged: Vec<Vec<bool>> = vec![vec![false; total_bits]; max_width];
+        let left_rows = tape.mm_to_rows(left_margin_mm);
+        let right_rows = tape.mm_to_rows(right_margin_mm);
+        // Width of the printed block: the widest line, or the space
+        // between the margins on a fixed-length label.
+        let content_dots = match fixed_length_mm {
+            None => max_width,
+            Some(len_mm) => {
+                let total_rows = tape.mm_to_rows(len_mm) as usize;
+                let margins = (left_rows + right_rows) as usize;
+                if total_rows <= margins {
+                    anyhow::bail!(
+                        "label length {len_mm}mm leaves no room for text after the {}mm + {}mm margins",
+                        left_margin_mm, right_margin_mm
+                    );
+                }
+                let content = total_rows - margins;
+                if max_width > content {
+                    anyhow::bail!(
+                        "text is {:.1}mm wide but only {:.1}mm fits on a {len_mm}mm label after the margins; \
+                         wrapping is not supported with --line-ratios, so shorten the text, reduce the size, \
+                         or use a longer label",
+                        tape.rows_to_mm(max_width as u32),
+                        tape.rows_to_mm(content as u32)
+                    );
+                }
+                content
+            }
+        };
 
-        for (line_idx, (fb, _advance)) in rasterized.iter().enumerate() {
+        let mut merged: Vec<Vec<bool>> = vec![vec![false; total_bits]; content_dots];
+
+        for (line_idx, (fb, advance)) in rasterized.iter().enumerate() {
             let (band_start, band_end) = bounds[line_idx];
             let band_head_bits = band_end - band_start;
             let ink_h = Self::ink_height(fb);
@@ -644,6 +744,7 @@ impl FontRenderer {
                 0
             };
             let bit_start_signed = band_start as isize + v_offset as isize - ink_top as isize;
+            let h_offset = Self::h_offset_for(align, content_dots, advance.ceil() as usize);
 
             Self::place_framebuf_at(
                 fb,
@@ -654,8 +755,8 @@ impl FontRenderer {
                 bit_start_signed,
                 band_start,
                 band_head_bits,
-                0,
-                max_width,
+                h_offset,
+                content_dots,
             );
         }
 
@@ -664,14 +765,19 @@ impl FontRenderer {
             .map(|col| pack_bits(col, tape.bitmap_bytes()))
             .collect();
 
-        let first_nonblank = rows.iter().position(|r| r.iter().any(|&b| b != 0));
-        let last_nonblank = rows.iter().rposition(|r| r.iter().any(|&b| b != 0));
-        let trimmed = match (first_nonblank, last_nonblank) {
-            (Some(first), Some(last)) => rows[first..=last].to_vec(),
-            _ => Vec::new(),
+        // Free length: trim blank columns so the label hugs the ink. Fixed
+        // length: keep the whole content block so the label is exactly as
+        // long as requested.
+        let trimmed = if fixed_length_mm.is_some() {
+            rows
+        } else {
+            let first_nonblank = rows.iter().position(|r| r.iter().any(|&b| b != 0));
+            let last_nonblank = rows.iter().rposition(|r| r.iter().any(|&b| b != 0));
+            match (first_nonblank, last_nonblank) {
+                (Some(first), Some(last)) => rows[first..=last].to_vec(),
+                _ => Vec::new(),
+            }
         };
-        let left_rows = mm_to_rows(left_margin_mm);
-        let right_rows = mm_to_rows(right_margin_mm);
         let blank_row = vec![0u8; tape.bitmap_bytes()];
         let mut padded = Vec::with_capacity(trimmed.len() + left_rows as usize + right_rows as usize);
         padded.extend(std::iter::repeat(blank_row.clone()).take(left_rows as usize));
@@ -703,7 +809,7 @@ impl FontRenderer {
         &self,
         text: &str,
         size_pt: Option<f32>,
-        tape: TapeWidth,
+        tape: Tape,
         left_margin_mm: f32,
         right_margin_mm: f32,
         tape_length_mm: f32,
@@ -717,10 +823,10 @@ impl FontRenderer {
             .saturating_sub(top_margin_bits + bottom_margin_bits)
             .max(1);
         let head_offset = bottom_margin_bits;
-        let left_rows = mm_to_rows(left_margin_mm);
-        let right_rows = mm_to_rows(right_margin_mm);
+        let left_rows = tape.mm_to_rows(left_margin_mm);
+        let right_rows = tape.mm_to_rows(right_margin_mm);
         let content_length_dots =
-            (mm_to_rows(tape_length_mm) as f32 - left_rows as f32 - right_rows as f32).max(1.0);
+            (tape.mm_to_rows(tape_length_mm) as f32 - left_rows as f32 - right_rows as f32).max(1.0);
         let content_dots = content_length_dots as usize;
 
         let max_lines = (tape.width_mm() as f32 / MIN_LINE_HEIGHT_MM).floor() as usize;
@@ -741,7 +847,7 @@ impl FontRenderer {
 
             // provisional_px: size such that font's ascent–descent fills one band.
             let provisional_px = match size_pt {
-                Some(pt) => pt_to_px(pt),
+                Some(pt) => pt_to_px(pt, tape.model),
                 None => {
                     let ratio = self.line_height_px(1.0);
                     band_head_bits as f32 / ratio
@@ -838,23 +944,7 @@ impl FontRenderer {
                 band_start as isize + v_offset as isize - ink_top as isize;
 
             let line_width_dots = advance.round() as usize;
-            let h_offset = match align {
-                TextAlign::Left => 0,
-                TextAlign::Center => {
-                    if content_dots > line_width_dots {
-                        (content_dots - line_width_dots) / 2
-                    } else {
-                        0
-                    }
-                }
-                TextAlign::Right => {
-                    if content_dots > line_width_dots {
-                        content_dots - line_width_dots
-                    } else {
-                        0
-                    }
-                }
-            };
+            let h_offset = Self::h_offset_for(align, content_dots, line_width_dots);
 
             Self::place_framebuf_at(
                 &fb,
@@ -1068,19 +1158,139 @@ mod tests {
     #[test]
     fn max_size_shrinks_with_narrower_tape() {
         let renderer = default_renderer();
-        let max_6mm = renderer.max_size_pt_for_tape(TapeWidth::Mm6, TapeWidth::HEAD_MARGIN_BITS, TapeWidth::HEAD_MARGIN_BITS);
-        let max_12mm = renderer.max_size_pt_for_tape(TapeWidth::Mm12, TapeWidth::HEAD_MARGIN_BITS, TapeWidth::HEAD_MARGIN_BITS);
-        let max_18mm = renderer.max_size_pt_for_tape(TapeWidth::Mm18, TapeWidth::HEAD_MARGIN_BITS, TapeWidth::HEAD_MARGIN_BITS);
-        let max_24mm = renderer.max_size_pt_for_tape(TapeWidth::Mm24, TapeWidth::HEAD_MARGIN_BITS, TapeWidth::HEAD_MARGIN_BITS);
-        assert!(max_6mm < max_12mm);
+        let max_6mm = renderer.max_size_pt_for_tape(Tape::sr3700p(TapeWidth::Mm6), TapeWidth::HEAD_MARGIN_BITS, TapeWidth::HEAD_MARGIN_BITS);
+        let max_9mm = renderer.max_size_pt_for_tape(Tape::sr3700p(TapeWidth::Mm9), TapeWidth::HEAD_MARGIN_BITS, TapeWidth::HEAD_MARGIN_BITS);
+        let max_12mm = renderer.max_size_pt_for_tape(Tape::sr3700p(TapeWidth::Mm12), TapeWidth::HEAD_MARGIN_BITS, TapeWidth::HEAD_MARGIN_BITS);
+        let max_18mm = renderer.max_size_pt_for_tape(Tape::sr3700p(TapeWidth::Mm18), TapeWidth::HEAD_MARGIN_BITS, TapeWidth::HEAD_MARGIN_BITS);
+        let max_24mm = renderer.max_size_pt_for_tape(Tape::sr3700p(TapeWidth::Mm24), TapeWidth::HEAD_MARGIN_BITS, TapeWidth::HEAD_MARGIN_BITS);
+        let max_36mm = renderer.max_size_pt_for_tape(Tape::sr3700p(TapeWidth::Mm36), TapeWidth::HEAD_MARGIN_BITS, TapeWidth::HEAD_MARGIN_BITS);
+        assert!(max_6mm < max_9mm);
+        assert!(max_9mm < max_12mm);
         assert!(max_12mm < max_18mm);
         assert!(max_18mm < max_24mm);
+        // On the SR3700P both 24mm and 36mm are limited by the 192-dot head.
+        assert_eq!(max_24mm, max_36mm);
+
+        // On the SR3900P every width is strictly wider than the previous.
+        let sizes: Vec<f32> = TapeWidth::ALL
+            .iter()
+            .map(|w| renderer.max_size_pt_for_tape(w.on(Model::Sr3900p), TapeWidth::HEAD_MARGIN_BITS, TapeWidth::HEAD_MARGIN_BITS))
+            .collect();
+        for pair in sizes.windows(2) {
+            assert!(pair[0] < pair[1], "{sizes:?}");
+        }
+        // Point sizes are scaled per model so a similar physical band gives
+        // a similar point size: 18mm is 168 dots @ 270 dpi on the SR3700P
+        // (15.8mm) and 216 dots @ 360 dpi on the SR3900P (15.2mm).
+        let max_18mm_3900 = renderer.max_size_pt_for_tape(TapeWidth::Mm18.on(Model::Sr3900p), TapeWidth::HEAD_MARGIN_BITS, TapeWidth::HEAD_MARGIN_BITS);
+        assert!((max_18mm_3900 / max_18mm - 1.0).abs() < 0.05, "{max_18mm_3900} vs {max_18mm}");
+    }
+
+    /// Returns the first and last inked row (feed direction) within the
+    /// band of `line_idx` out of `num_lines` equal bands.
+    fn band_ink_extent(rows: &[Vec<u8>], tape: Tape, line_idx: usize, num_lines: usize, top: usize, bottom: usize) -> (usize, usize) {
+        let total_bits = tape.bitmap_bits();
+        let head_bits = total_bits - top - bottom;
+        let band = head_bits / num_lines;
+        // Bands are mirrored: line 0 is the top band = highest bit positions.
+        let band_start = bottom + (num_lines - 1 - line_idx) * band;
+        let bits = band_start..band_start + band;
+        let inked: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| bits.clone().any(|b| (r[b / 8] >> (7 - b % 8)) & 1 == 1))
+            .map(|(i, _)| i)
+            .collect();
+        (*inked.first().unwrap(), *inked.last().unwrap())
+    }
+
+    #[test]
+    fn multiline_without_length_honours_alignment() {
+        let renderer = default_renderer();
+        let tape = Tape::sr3700p(TapeWidth::Mm18);
+        let text = "WWWWWWWW\ni";
+        let mut extents = Vec::new();
+        for align in [TextAlign::Left, TextAlign::Center, TextAlign::Right] {
+            let (rows, margin) = renderer.render_text_aligned(text, 12.0, tape, 0.0, 0.0, 2, 0, align);
+            assert_eq!(margin, 0);
+            let long = band_ink_extent(&rows, tape, 0, 2, 2, 0);
+            let short = band_ink_extent(&rows, tape, 1, 2, 2, 0);
+            extents.push((align, long, short));
+        }
+        let (_, long, left) = extents[0];
+        let (_, _, center) = extents[1];
+        let (_, _, right) = extents[2];
+        // The long line spans the label in every mode; the short line moves.
+        assert!(left.0 < center.0 && center.0 < right.0, "{extents:?}");
+        assert!(left.0 <= long.0 + 2, "left-aligned short line starts at the left edge: {extents:?}");
+        // The advance width includes the glyph's side bearing, so allow a few dots.
+        assert!(right.1 + 12 >= long.1, "right-aligned short line ends at the right edge: {extents:?}");
+        let mid_long = (long.0 + long.1) / 2;
+        let mid_center = (center.0 + center.1) / 2;
+        // Centred by advance width, so the ink can sit a few dots off (side bearings).
+        assert!((mid_long as isize - mid_center as isize).abs() <= 8, "centred short line is centred: {extents:?}");
+
+        // Ratios path, same expectation.
+        let (rows_l, _) = renderer.render_text_ratios_aligned(text, None, &[1.0, 1.0], tape, 0.0, 0.0, 2, 0, TextAlign::Left, None).unwrap();
+        let (rows_r, _) = renderer.render_text_ratios_aligned(text, None, &[1.0, 1.0], tape, 0.0, 0.0, 2, 0, TextAlign::Right, None).unwrap();
+        let s_l = band_ink_extent(&rows_l, tape, 1, 2, 2, 0);
+        let s_r = band_ink_extent(&rows_r, tape, 1, 2, 2, 0);
+        assert!(s_l.0 < s_r.0, "ratios: {s_l:?} vs {s_r:?}");
+    }
+
+    #[test]
+    fn ratios_with_fixed_length_pad_and_align_without_wrapping() {
+        let renderer = default_renderer();
+        let tape = TapeWidth::Mm18.on(Model::Sr3900p);
+        let text = "HOST\n10.0.0.1";
+        // Fits: the label is exactly the requested length and the short
+        // line moves with the alignment.
+        let (rows_l, margin) = renderer
+            .render_text_ratios_aligned(text, Some(14.0), &[7.0, 3.0], tape, 4.0, 3.0, 2, 0, TextAlign::Left, Some(60.0))
+            .unwrap();
+        assert_eq!(rows_l.len() as u32, tape.mm_to_rows(60.0));
+        assert_eq!(margin, tape.mm_to_rows(4.0));
+        let (rows_r, _) = renderer
+            .render_text_ratios_aligned(text, Some(14.0), &[7.0, 3.0], tape, 4.0, 3.0, 2, 0, TextAlign::Right, Some(60.0))
+            .unwrap();
+        assert_eq!(rows_r.len(), rows_l.len());
+        let first_ink = |rows: &[Vec<u8>]| rows.iter().position(|r| r.iter().any(|&b| b != 0)).unwrap();
+        assert!(first_ink(&rows_r) > first_ink(&rows_l));
+
+        // Single line with a fixed length is padded too.
+        let (one, _) = renderer
+            .render_text_ratios_aligned("HOST", Some(14.0), &[1.0], tape, 4.0, 3.0, 2, 0, TextAlign::Center, Some(60.0))
+            .unwrap();
+        assert_eq!(one.len() as u32, tape.mm_to_rows(60.0));
+
+        // Too long for the label: an error, never wrapping.
+        let err = renderer
+            .render_text_ratios_aligned(text, Some(14.0), &[7.0, 3.0], tape, 4.0, 3.0, 2, 0, TextAlign::Left, Some(15.0))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("fits"), "{err}");
+        let err = renderer
+            .render_text_ratios_aligned(text, Some(14.0), &[7.0, 3.0], tape, 4.0, 3.0, 2, 0, TextAlign::Left, Some(5.0))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("margins"), "{err}");
+    }
+
+    #[test]
+    fn point_scale_matches_captured_character_pitch() {
+        // 0.5 em half-width pitch in the captures (see APP_PT_SCALE).
+        let em_3700 = pt_to_px(36.0, Model::Sr3700p);
+        assert!((em_3700 / 2.0 - 74.0).abs() < 1.0, "SR3700P 36pt half-width pitch {}", em_3700 / 2.0);
+        let em_3900 = pt_to_px(16.0, Model::Sr3900p);
+        assert!((em_3900 / 2.0 - 43.8).abs() < 1.0, "SR3900P 16pt half-width pitch {}", em_3900 / 2.0);
+        // Round trip.
+        assert!((px_to_pt(pt_to_px(12.5, Model::Sr3900p), Model::Sr3900p) - 12.5).abs() < 1e-4);
     }
 
     #[test]
     fn max_size_does_not_clip() {
         let renderer = default_renderer();
-        for tape in [TapeWidth::Mm6, TapeWidth::Mm12, TapeWidth::Mm18, TapeWidth::Mm24] {
+        for tape in TapeWidth::ALL.map(Tape::sr3700p) {
             let max = renderer.max_size_pt_for_tape(tape, TapeWidth::HEAD_MARGIN_BITS, TapeWidth::HEAD_MARGIN_BITS);
             assert!(!renderer.would_clip(max, tape, TapeWidth::HEAD_MARGIN_BITS, TapeWidth::HEAD_MARGIN_BITS));
             // A couple of points larger should clip.
@@ -1093,7 +1303,7 @@ mod tests {
         let renderer = default_renderer();
         // 36pt was captured to clip visibly on 12mm tape in real hardware
         // testing; the much narrower 6mm tape should clip it too.
-        assert!(renderer.would_clip(36.0, TapeWidth::Mm6, TapeWidth::HEAD_MARGIN_BITS, TapeWidth::HEAD_MARGIN_BITS));
+        assert!(renderer.would_clip(36.0, Tape::sr3700p(TapeWidth::Mm6), TapeWidth::HEAD_MARGIN_BITS, TapeWidth::HEAD_MARGIN_BITS));
     }
 
     #[test]
@@ -1107,7 +1317,7 @@ mod tests {
     #[test]
     fn split_at_width_fits_single_line() {
         let renderer = default_renderer();
-        let size_px = pt_to_px(12.0);
+        let size_px = pt_to_px(12.0, Model::Sr3700p);
         // A very wide max width: everything fits, overflow is empty.
         let (fit, overflow) = renderer.split_at_width("ABC", size_px, 10000.0);
         assert_eq!(fit, "ABC");
@@ -1117,7 +1327,7 @@ mod tests {
     #[test]
     fn split_at_width_wraps_when_narrow() {
         let renderer = default_renderer();
-        let size_px = pt_to_px(12.0);
+        let size_px = pt_to_px(12.0, Model::Sr3700p);
         // Width=1: only the first char (or nothing extra) fits.
         let (fit, overflow) = renderer.split_at_width("ABC", size_px, 1.0);
         assert!(!overflow.is_empty(), "expected overflow for narrow width");
@@ -1127,7 +1337,7 @@ mod tests {
     #[test]
     fn split_at_width_explicit_newline_handled_by_caller() {
         let renderer = default_renderer();
-        let size_px = pt_to_px(12.0);
+        let size_px = pt_to_px(12.0, Model::Sr3700p);
         // \n splitting is done before split_at_width (by render_text_multiline).
         // split_at_width sees each segment without \n.
         let segments: Vec<&str> = "AB\nCD".split('\n').collect();
@@ -1143,7 +1353,7 @@ mod tests {
     #[test]
     fn split_at_width_empty_segment() {
         let renderer = default_renderer();
-        let size_px = pt_to_px(12.0);
+        let size_px = pt_to_px(12.0, Model::Sr3700p);
         let (fit, overflow) = renderer.split_at_width("", size_px, 10000.0);
         assert_eq!(fit, "");
         assert_eq!(overflow, "");
@@ -1155,7 +1365,7 @@ mod tests {
         let (rows, margin) = renderer.render_text_multiline(
             "Hello World",
             None,
-            TapeWidth::Mm18,
+            Tape::sr3700p(TapeWidth::Mm18),
             DEFAULT_FEED_MARGIN_MM,
             DEFAULT_FEED_MARGIN_MM,
             50.0,
@@ -1172,7 +1382,7 @@ mod tests {
     #[track_caller]
     fn assert_ascii_art(
         rows: &[Vec<u8>],
-        tape: TapeWidth,
+        tape: Tape,
         top_margin_bits: usize,
         bottom_margin_bits: usize,
         max_cols: usize,
@@ -1206,7 +1416,7 @@ mod tests {
         // line 1 occupies the second half (bit_start=head_bits/2).
         // Both halves should contain ink.
         let renderer = default_renderer();
-        for tape in [TapeWidth::Mm12, TapeWidth::Mm18] {
+        for tape in [Tape::sr3700p(TapeWidth::Mm12), Tape::sr3700p(TapeWidth::Mm18)] {
             let (rows, _margin) = renderer.render_text_multiline(
                 "D39M-06N\n420V20A",
                 None,
@@ -1247,7 +1457,7 @@ mod tests {
     fn multiline_6mm_tape_length_32_fits_single_line() {
         let renderer = default_renderer();
         let text = "D39M-06N 420V20A";
-        let tape = TapeWidth::Mm6;
+        let tape = Tape::sr3700p(TapeWidth::Mm6);
         let tape_length_mm = 32.0;
 
         let (rows, _margin) = renderer.render_text_multiline(
@@ -1282,7 +1492,7 @@ mod tests {
     #[test]
     fn render_6mm_descender_text_not_clipped() {
         let renderer = default_renderer();
-        let tape = TapeWidth::Mm6;
+        let tape = Tape::sr3700p(TapeWidth::Mm6);
         let (rows, _margin) = renderer.render_text_multiline(
             "D39pb",
             None,
@@ -1298,219 +1508,231 @@ mod tests {
         assert!(!rows.is_empty(), "expected non-empty output");
 
         assert_ascii_art(&rows, tape, TapeWidth::HEAD_MARGIN_BITS, TapeWidth::HEAD_MARGIN_BITS, 120, "\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|...##################################..|...........\n\
-............|...##################################..|...........\n\
-............|...##################################..|...........\n\
-............|...##################################..|...........\n\
-............|...###............................###..|...........\n\
-............|...###............................###..|...........\n\
-............|...###............................###..|...........\n\
-............|...###............................###..|...........\n\
-............|...###............................###..|...........\n\
-............|...###............................###..|...........\n\
-............|...###............................###..|...........\n\
-............|...###............................###..|...........\n\
-............|...####...........................###..|...........\n\
-............|...####..........................####..|...........\n\
-............|...####..........................####..|...........\n\
-............|...####..........................####..|...........\n\
-............|....###..........................###...|...........\n\
-............|....####........................####...|...........\n\
-............|....####........................####...|...........\n\
-............|.....####......................####....|...........\n\
-............|.....#####.....................####....|...........\n\
-............|......#####...................####.....|...........\n\
-............|......######................######.....|...........\n\
-............|.......#######.............######......|...........\n\
-............|........#########......#########.......|...........\n\
-............|.........######################........|...........\n\
-............|...........##################..........|...........\n\
-............|.............##############............|...........\n\
-............|................########...............|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|......##...............................|...........\n\
-............|......###........................#.....|...........\n\
-............|.....####.......................###....|...........\n\
-............|....#####......................####....|...........\n\
-............|....####........................####...|...........\n\
-............|...####.........................####...|...........\n\
-............|...####..........................####..|...........\n\
-............|...###.............###............###..|...........\n\
-............|...###.............####...........###..|...........\n\
-............|..####.............####...........###..|...........\n\
-............|..####.............####...........####.|...........\n\
-............|..####.............####...........####.|...........\n\
-............|..####.............####...........####.|...........\n\
-............|..####.............####...........####.|...........\n\
-............|..####.............####...........####.|...........\n\
-............|...###.............####...........###..|...........\n\
-............|...###............######.........####..|...........\n\
-............|...####...........##..###........####..|...........\n\
-............|...#####.........###..####......####...|...........\n\
-............|....#####.......####..##############...|...........\n\
-............|....###############....############....|...........\n\
-............|.....##############.....##########.....|...........\n\
-............|......############.......########......|...........\n\
-............|.......#########.......................|...........\n\
-............|..........####.........................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.....................#########.........|...........\n\
-............|...................#############.......|...........\n\
-............|..................################.....|...........\n\
-............|.................##################....|...........\n\
-............|...##...........######........#####....|...........\n\
-............|..###...........####...........#####...|...........\n\
-............|..###..........####..............####..|...........\n\
-............|..####.........####..............####..|...........\n\
-............|..####.........###................###..|...........\n\
-............|...###........####................####.|...........\n\
-............|...###........####................####.|...........\n\
-............|...####.......####................####.|...........\n\
-............|...####........###................####.|...........\n\
-............|....####.......###................####.|...........\n\
-............|....####.......###................###..|...........\n\
-............|.....####.......###..............####..|...........\n\
-............|.....#####......####............#####..|...........\n\
-............|......######.....####..........#####...|...........\n\
-............|.......#######....#####......######....|...........\n\
-............|........#########..################....|...........\n\
-............|.........########################......|...........\n\
-............|...........#####################.......|...........\n\
-............|..............################.........|...........\n\
-............|..................########.............|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|############################...........|...........\n\
-............|############################...........|...........\n\
-............|############################...........|...........\n\
-............|############################...........|...........\n\
-............|........####.........####..............|...........\n\
-............|.......###............####.............|...........\n\
-............|......###..............####............|...........\n\
-............|.....###................###............|...........\n\
-............|.....###................####...........|...........\n\
-............|....####.................###...........|...........\n\
-............|....###..................###...........|...........\n\
-............|....###..................###...........|...........\n\
-............|....###..................###...........|...........\n\
-............|....###..................###...........|...........\n\
-............|....####.................###...........|...........\n\
-............|....####................####...........|...........\n\
-............|.....####...............####...........|...........\n\
-............|.....#####.............####............|...........\n\
-............|......#####..........######............|...........\n\
-............|......########....########.............|...........\n\
-............|.......##################..............|...........\n\
-............|........################...............|...........\n\
-............|..........############.................|...........\n\
-............|..............#####....................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|...####################################|...........\n\
-............|...####################################|...........\n\
-............|...####################################|...........\n\
-............|.....##################################|...........\n\
-............|.....#####...........####..............|...........\n\
-............|.....###..............####.............|...........\n\
-............|....###................####............|...........\n\
-............|...####.................###............|...........\n\
-............|...###..................####...........|...........\n\
-............|...###...................###...........|...........\n\
-............|..####...................###...........|...........\n\
-............|..####...................###...........|...........\n\
-............|..####...................###...........|...........\n\
-............|..####...................###...........|...........\n\
-............|..####...................###...........|...........\n\
-............|...####.................####...........|...........\n\
-............|...####................#####...........|...........\n\
-............|....####..............#####............|...........\n\
-............|....######...........#####.............|...........\n\
-............|.....########....#########.............|...........\n\
-............|......###################..............|...........\n\
-............|.......################................|...........\n\
-............|.........############..................|...........\n\
-............|.............#####.....................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........");
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|...##################################..|.......\n\
+........|...##################################..|.......\n\
+........|...##################################..|.......\n\
+........|...##################################..|.......\n\
+........|...###............................###..|.......\n\
+........|...###............................###..|.......\n\
+........|...###............................###..|.......\n\
+........|...###............................###..|.......\n\
+........|...###............................###..|.......\n\
+........|...###............................###..|.......\n\
+........|...###............................###..|.......\n\
+........|...###............................###..|.......\n\
+........|...####...........................###..|.......\n\
+........|...####..........................####..|.......\n\
+........|...####..........................####..|.......\n\
+........|...####..........................####..|.......\n\
+........|....###..........................###...|.......\n\
+........|....####........................####...|.......\n\
+........|....####........................####...|.......\n\
+........|.....####......................####....|.......\n\
+........|.....#####.....................####....|.......\n\
+........|......#####...................####.....|.......\n\
+........|......######................######.....|.......\n\
+........|.......#######.............######......|.......\n\
+........|........#########......#########.......|.......\n\
+........|.........######################........|.......\n\
+........|...........##################..........|.......\n\
+........|.............##############............|.......\n\
+........|................########...............|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|......##...............................|.......\n\
+........|......###........................#.....|.......\n\
+........|.....####.......................###....|.......\n\
+........|....#####......................####....|.......\n\
+........|....####........................####...|.......\n\
+........|...####.........................####...|.......\n\
+........|...####..........................####..|.......\n\
+........|...###.............###............###..|.......\n\
+........|...###.............####...........###..|.......\n\
+........|..####.............####...........###..|.......\n\
+........|..####.............####...........####.|.......\n\
+........|..####.............####...........####.|.......\n\
+........|..####.............####...........####.|.......\n\
+........|..####.............####...........####.|.......\n\
+........|..####.............####...........####.|.......\n\
+........|...###.............####...........###..|.......\n\
+........|...###............######.........####..|.......\n\
+........|...####...........##..###........####..|.......\n\
+........|...#####.........###..####......####...|.......\n\
+........|....#####.......####..##############...|.......\n\
+........|....###############....############....|.......\n\
+........|.....##############.....##########.....|.......\n\
+........|......############.......########......|.......\n\
+........|.......#########.......................|.......\n\
+........|..........####.........................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.....................#########.........|.......\n\
+........|...................#############.......|.......\n\
+........|..................################.....|.......\n\
+........|.................##################....|.......\n\
+........|...##...........######........#####....|.......\n\
+........|..###...........####...........#####...|.......\n\
+........|..###..........####..............####..|.......\n\
+........|..####.........####..............####..|.......\n\
+........|..####.........###................###..|.......\n\
+........|...###........####................####.|.......\n\
+........|...###........####................####.|.......\n\
+........|...####.......####................####.|.......\n\
+........|...####........###................####.|.......\n\
+........|....####.......###................####.|.......\n\
+........|....####.......###................###..|.......\n\
+........|.....####.......###..............####..|.......\n\
+........|.....#####......####............#####..|.......\n\
+........|......######.....####..........#####...|.......\n\
+........|.......#######....#####......######....|.......\n\
+........|........#########..################....|.......\n\
+........|.........########################......|.......\n\
+........|...........#####################.......|.......\n\
+........|..............################.........|.......\n\
+........|..................########.............|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|############################...........|.......\n\
+........|############################...........|.......\n\
+........|############################...........|.......\n\
+........|############################...........|.......\n\
+........|........####.........####..............|.......\n\
+........|.......###............####.............|.......\n\
+........|......###..............####............|.......\n\
+........|.....###................###............|.......\n\
+........|.....###................####...........|.......\n\
+........|....####.................###...........|.......\n\
+........|....###..................###...........|.......\n\
+........|....###..................###...........|.......\n\
+........|....###..................###...........|.......\n\
+........|....###..................###...........|.......\n\
+........|....####.................###...........|.......\n\
+........|....####................####...........|.......\n\
+........|.....####...............####...........|.......\n\
+........|.....#####.............####............|.......\n\
+........|......#####..........######............|.......\n\
+........|......########....########.............|.......\n\
+........|.......##################..............|.......\n\
+........|........################...............|.......\n\
+........|..........############.................|.......\n\
+........|..............#####....................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|...####################################|.......\n\
+........|...####################################|.......\n\
+........|...####################################|.......\n\
+........|.....##################################|.......\n\
+........|.....#####...........####..............|.......\n\
+........|.....###..............####.............|.......\n\
+........|....###................####............|.......\n\
+........|...####.................###............|.......\n\
+........|...###..................####...........|.......\n\
+........|...###...................###...........|.......\n\
+........|..####...................###...........|.......\n\
+........|..####...................###...........|.......\n\
+........|..####...................###...........|.......\n\
+........|..####...................###...........|.......\n\
+........|..####...................###...........|.......\n\
+........|...####.................####...........|.......\n\
+........|...####................#####...........|.......\n\
+........|....####..............#####............|.......\n\
+........|....######...........#####.............|.......\n\
+........|.....########....#########.............|.......\n\
+........|......###################..............|.......\n\
+........|.......################................|.......\n\
+........|.........############..................|.......\n\
+........|.............#####.....................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......");
     }
 
-    /// Snapshot test: `"D39pb"` on 6mm tape with top-margin=0, bottom-margin=8.
-    ///
-    /// Verifies that asymmetric margins shift the printable area correctly:
-    /// no top guard band, 8-bit bottom guard.
+    /// Snapshot test: `"D39pb"` on 6mm tape with no margins at all
+    /// (top-margin=0, bottom-margin=0): the whole 56-dot row is printable.
     #[test]
-    fn render_6mm_descender_top0_bottom8() {
+    fn render_6mm_descender_no_margins() {
         let renderer = default_renderer();
-        let tape = TapeWidth::Mm6;
+        let tape = Tape::sr3700p(TapeWidth::Mm6);
         let (rows, _margin) = renderer.render_text_multiline(
             "D39pb",
             None,
@@ -1520,179 +1742,159 @@ mod tests {
             32.0,
             TextAlign::Left,
             0,   // top_margin_bits
-            8,   // bottom_margin_bits
+            0,   // bottom_margin_bits
         );
 
         assert!(!rows.is_empty(), "expected non-empty output");
 
-        assert_ascii_art(&rows, tape, 0, 8, 120, "\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|................#########################..............\n\
-........|................#########################..............\n\
-........|................#########################..............\n\
-........|................###...................###..............\n\
-........|................###...................###..............\n\
-........|................###...................###..............\n\
-........|................###...................###..............\n\
-........|................###...................###..............\n\
-........|................###...................###..............\n\
-........|................###...................###..............\n\
-........|.................##...................##...............\n\
-........|.................##...................##...............\n\
-........|.................###.................###...............\n\
-........|.................###.................###...............\n\
-........|..................###...............###................\n\
-........|..................####.............####................\n\
-........|...................#####..........####.................\n\
-........|....................#######...#######..................\n\
-........|.....................###############...................\n\
-........|.......................###########.....................\n\
-........|...........................###.........................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|...................#...................................\n\
-........|..................###................##................\n\
-........|.................###................###................\n\
-........|.................###.................###...............\n\
-........|................###...................##...............\n\
-........|................###.........##........###..............\n\
-........|................##..........##........###..............\n\
-........|................##..........##.........##..............\n\
-........|................##..........##.........##..............\n\
-........|................##..........##.........##..............\n\
-........|................##..........###........##..............\n\
-........|................###........####.......###..............\n\
-........|................###........#####......###..............\n\
-........|.................###......###.###....###...............\n\
-........|.................####....###..##########...............\n\
-........|..................##########...########................\n\
-........|...................########......####..................\n\
-........|.....................####..............................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.............................#######...................\n\
-........|...........................###########.................\n\
-........|..........................#############................\n\
-........|................##.......####.......####...............\n\
-........|................##.......###.........###...............\n\
-........|................##.......##...........###..............\n\
-........|................##.......##............##..............\n\
-........|................###.....###............##..............\n\
-........|.................##......##............##..............\n\
-........|.................###.....##............##..............\n\
-........|.................###.....##...........###..............\n\
-........|..................###.....##..........##...............\n\
-........|...................####...###.......####...............\n\
-........|....................#####...####..#####................\n\
-........|.....................#################.................\n\
-........|.......................##############..................\n\
-........|..........................########.....................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.............#####################.....................\n\
-........|.............#####################.....................\n\
-........|..............##################.......................\n\
-........|...................###........##.......................\n\
-........|..................###..........##......................\n\
-........|..................##...........###.....................\n\
-........|.................###............##.....................\n\
-........|.................##.............##.....................\n\
-........|.................##.............##.....................\n\
-........|.................##.............##.....................\n\
-........|.................###............##.....................\n\
-........|.................###...........###.....................\n\
-........|..................###.........####.....................\n\
-........|..................#####......####......................\n\
-........|...................#############.......................\n\
-........|....................###########........................\n\
-........|.......................#####...........................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|................##########################.............\n\
-........|................##########################.............\n\
-........|..................########################.............\n\
-........|..................##..........##.......................\n\
-........|.................##............##......................\n\
-........|................###............###.....................\n\
-........|................##..............##.....................\n\
-........|................##..............##.....................\n\
-........|................##..............##.....................\n\
-........|................##..............##.....................\n\
-........|................###.............##.....................\n\
-........|................###............###.....................\n\
-........|.................###..........###......................\n\
-........|.................#####......#####......................\n\
-........|..................##############.......................\n\
-........|....................##########.........................\n\
-........|......................######...........................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................\n\
-........|.......................................................");
+        assert_ascii_art(&rows, tape, 0, 0, 120, "\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.....###############################################...\n\
+|.....###############################################...\n\
+|.....###############################################...\n\
+|.....####.......................................####...\n\
+|.....####.......................................####...\n\
+|.....####.......................................####...\n\
+|.....####.......................................####...\n\
+|.....####.......................................####...\n\
+|.....####.......................................####...\n\
+|.....#####.....................................#####...\n\
+|.....#####.....................................#####...\n\
+|.....######...................................######...\n\
+|......#####...................................#####....\n\
+|.......#####.................................#####.....\n\
+|........######.............................######......\n\
+|.........#######.........................#######.......\n\
+|..........#########...................#########........\n\
+|............#################################..........\n\
+|...............###########################.............\n\
+|...................###################.................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|..........#............................................\n\
+|........#####.................................##.......\n\
+|.......######...............................######.....\n\
+|......#####..................................######....\n\
+|.....#####....................................######...\n\
+|....#####...................####...............#####...\n\
+|....#####...................####................#####..\n\
+|....####....................####.................####..\n\
+|....####...................#####.................####..\n\
+|....####...................#####.................####..\n\
+|....#####..................######...............#####..\n\
+|....#####.................########..............#####..\n\
+|.....#####...............####..####............#####...\n\
+|.....######.............#####..######.......#######....\n\
+|......#########.....########....##################.....\n\
+|........###################.......##############.......\n\
+|..........###############.............#######..........\n\
+|..............######...................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.................................#######...............\n\
+|............................#################..........\n\
+|.........................#######################.......\n\
+|.....###...............#########.........#########.....\n\
+|...#####..............#######................######....\n\
+|...#####.............######....................#####...\n\
+|....####.............#####......................#####..\n\
+|....#####............####........................####..\n\
+|.....#####...........####........................####..\n\
+|.....######..........####........................####..\n\
+|......######.........#####......................#####..\n\
+|.......#######........#####....................#####...\n\
+|.........#######........#####................#######...\n\
+|..........#########.......######..........########.....\n\
+|............#####################################......\n\
+|...............###############################.........\n\
+|....................######################.............\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|#######################################................\n\
+|#######################################................\n\
+|#######################################................\n\
+|..........######...............#####...................\n\
+|.........#####...................#####.................\n\
+|.......#####......................#####................\n\
+|.......####........................#####...............\n\
+|......#####.........................####...............\n\
+|......####..........................####...............\n\
+|......#####.........................####...............\n\
+|......#####........................#####...............\n\
+|.......#####......................#####................\n\
+|........######..................#######................\n\
+|.........#########..........#########..................\n\
+|..........##########################...................\n\
+|.............####################......................\n\
+|...................#########...........................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|....###################################################\n\
+|....###################################################\n\
+|.......################################################\n\
+|........#####.................######...................\n\
+|......#####......................#####.................\n\
+|.....####.........................#####................\n\
+|....#####..........................#####...............\n\
+|....####............................####...............\n\
+|....####............................####...............\n\
+|....####...........................#####...............\n\
+|....#####..........................#####...............\n\
+|.....#####.......................######................\n\
+|.....#######...................#######.................\n\
+|.......#########...........##########..................\n\
+|.........##########################....................\n\
+|............####################.......................\n\
+|.................##########............................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................\n\
+|.......................................................");
     }
 
         /// Snapshot test: `"Dpb\nFpb"` on 6mm tape (2 lines, all with descenders).
     #[test]
     fn render_6mm_two_line_descenders() {
         let renderer = default_renderer();
-        let tape = TapeWidth::Mm6;
+        let tape = Tape::sr3700p(TapeWidth::Mm6);
         let (rows, _margin) = renderer.render_text_multiline(
             "Dpb\nFpb",
             None,
@@ -1708,101 +1910,115 @@ mod tests {
         assert!(!rows.is_empty(), "expected non-empty output");
 
         assert_ascii_art(&rows, tape, TapeWidth::HEAD_MARGIN_BITS, TapeWidth::HEAD_MARGIN_BITS, 120, "\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|..################....################.|...........\n\
-............|.##################..##################|...........\n\
-............|.........##......##..##..............##|...........\n\
-............|.........##......##..##..............##|...........\n\
-............|.........##......##..##..............##|...........\n\
-............|.........##......##..##..............##|...........\n\
-............|.........##......##...#..............#.|...........\n\
-............|.........##......##...#..............#.|...........\n\
-............|.........##......##...##............##.|...........\n\
-............|.........##......##...##............##.|...........\n\
-............|.................#.....##..........##..|...........\n\
-............|.......................###........###..|...........\n\
-............|........................############...|...........\n\
-............|..........................########.....|...........\n\
-............|##############.........................|...........\n\
-............|##############.........................|...........\n\
-............|....#......##..........................|...........\n\
-............|...#........#..........................|...........\n\
-............|..##........##......##############.....|...........\n\
-............|..##.........#......##############.....|...........\n\
-............|..##.........#..........#......##......|...........\n\
-............|..##........##.........#........#......|...........\n\
-............|..###.......##........##........##.....|...........\n\
-............|...###....###.........##.........#.....|...........\n\
-............|....########..........##.........#.....|...........\n\
-............|......####............##........##.....|...........\n\
-............|......................###.......##.....|...........\n\
-............|.......................###....###......|...........\n\
-............|........................########.......|...........\n\
-............|.##################.......####.........|...........\n\
-............|..#################....................|...........\n\
-............|...#.......##..........................|...........\n\
-............|..#.........#..........................|...........\n\
-............|.##.........##.......##################|...........\n\
-............|.##..........#........#################|...........\n\
-............|.##.........##.........#.......##......|...........\n\
-............|.##.........##........#.........#......|...........\n\
-............|..##.......###.......##.........##.....|...........\n\
-............|..####....###........##..........#.....|...........\n\
-............|...#########.........##.........##.....|...........\n\
-............|.....#####...........##.........##.....|...........\n\
-............|......................##.......###.....|...........\n\
-............|......................####....###......|...........\n\
-............|.......................#########.......|...........\n\
-............|.........................#####.........|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........");
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|..################....################.|.......\n\
+........|.##################..##################|.......\n\
+........|.........##......##..##..............##|.......\n\
+........|.........##......##..##..............##|.......\n\
+........|.........##......##..##..............##|.......\n\
+........|.........##......##..##..............##|.......\n\
+........|.........##......##...#..............#.|.......\n\
+........|.........##......##...#..............#.|.......\n\
+........|.........##......##...##............##.|.......\n\
+........|.........##......##...##............##.|.......\n\
+........|.................#.....##..........##..|.......\n\
+........|.......................###........###..|.......\n\
+........|........................############...|.......\n\
+........|..........................########.....|.......\n\
+........|##############.........................|.......\n\
+........|##############.........................|.......\n\
+........|....#......##..........................|.......\n\
+........|...#........#..........................|.......\n\
+........|..##........##......##############.....|.......\n\
+........|..##.........#......##############.....|.......\n\
+........|..##.........#..........#......##......|.......\n\
+........|..##........##.........#........#......|.......\n\
+........|..###.......##........##........##.....|.......\n\
+........|...###....###.........##.........#.....|.......\n\
+........|....########..........##.........#.....|.......\n\
+........|......####............##........##.....|.......\n\
+........|......................###.......##.....|.......\n\
+........|.......................###....###......|.......\n\
+........|........................########.......|.......\n\
+........|.##################.......####.........|.......\n\
+........|..#################....................|.......\n\
+........|...#.......##..........................|.......\n\
+........|..#.........#..........................|.......\n\
+........|.##.........##.......##################|.......\n\
+........|.##..........#........#################|.......\n\
+........|.##.........##.........#.......##......|.......\n\
+........|.##.........##........#.........#......|.......\n\
+........|..##.......###.......##.........##.....|.......\n\
+........|..####....###........##..........#.....|.......\n\
+........|...#########.........##.........##.....|.......\n\
+........|.....#####...........##.........##.....|.......\n\
+........|......................##.......###.....|.......\n\
+........|......................####....###......|.......\n\
+........|.......................#########.......|.......\n\
+........|.........................#####.........|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......");
     }
 
     /// Snapshot test: `render_text` with `"Dpb\nFpb"` on 6mm tape (no tape-length
@@ -1812,7 +2028,7 @@ mod tests {
     #[test]
     fn render_text_6mm_newline_two_lines() {
         let renderer = default_renderer();
-        let tape = TapeWidth::Mm6;
+        let tape = Tape::sr3700p(TapeWidth::Mm6);
         let size_pt = renderer.max_size_pt_for_tape(
             tape,
             TapeWidth::HEAD_MARGIN_BITS,
@@ -1831,111 +2047,125 @@ mod tests {
         assert!(!rows.is_empty(), "expected non-empty output");
 
         assert_ascii_art(&rows, tape, TapeWidth::HEAD_MARGIN_BITS, TapeWidth::HEAD_MARGIN_BITS, 120, "\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|..################.....................|...........\n\
-............|..################....################.|...........\n\
-............|.........##.....##....################.|...........\n\
-............|.........##.....##....#.............##.|...........\n\
-............|.........##.....##....#.............##.|...........\n\
-............|.........##.....##....#.............##.|...........\n\
-............|.........##.....##....#.............##.|...........\n\
-............|.........##.....##....#.............##.|...........\n\
-............|.........##.....##....##............#..|...........\n\
-............|................##....##...........##..|...........\n\
-............|......................###..........##..|...........\n\
-............|.......................###........##...|...........\n\
-............|........................####...####....|...........\n\
-............|.........................#########.....|...........\n\
-............|#############...............###........|...........\n\
-............|#############..........................|...........\n\
-............|...##......#...........................|...........\n\
-............|...#........#..........................|...........\n\
-............|..##........#.......#############......|...........\n\
-............|..##........##......#############......|...........\n\
-............|..##........##.........##......#.......|...........\n\
-............|..##........#..........#........#......|...........\n\
-............|...##......##.........##........#......|...........\n\
-............|...#########..........##........##.....|...........\n\
-............|.....######...........##........##.....|...........\n\
-............|......................##........#......|...........\n\
-............|.......................##......##......|...........\n\
-............|.......................#########.......|...........\n\
-............|.##################......######........|...........\n\
-............|..################.....................|...........\n\
-............|..##.......#...........................|...........\n\
-............|..#........##..........................|...........\n\
-............|.##.........#........##################|...........\n\
-............|.##.........##........################.|...........\n\
-............|.##.........##........##.......#.......|...........\n\
-............|.##........##.........#........##......|...........\n\
-............|..##......###........##.........#......|...........\n\
-............|...#########.........##.........##.....|...........\n\
-............|....######...........##.........##.....|...........\n\
-............|.....................##........##......|...........\n\
-............|......................##......###......|...........\n\
-............|.......................#########.......|...........\n\
-............|........................######.........|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........\n\
-............|.......................................|...........");
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|..################.....................|.......\n\
+........|..################....################.|.......\n\
+........|.........##.....##....################.|.......\n\
+........|.........##.....##....#.............##.|.......\n\
+........|.........##.....##....#.............##.|.......\n\
+........|.........##.....##....#.............##.|.......\n\
+........|.........##.....##....#.............##.|.......\n\
+........|.........##.....##....#.............##.|.......\n\
+........|.........##.....##....##............#..|.......\n\
+........|................##....##...........##..|.......\n\
+........|......................###..........##..|.......\n\
+........|.......................###........##...|.......\n\
+........|........................####...####....|.......\n\
+........|.........................#########.....|.......\n\
+........|#############...............###........|.......\n\
+........|#############..........................|.......\n\
+........|...##......#...........................|.......\n\
+........|...#........#..........................|.......\n\
+........|..##........#.......#############......|.......\n\
+........|..##........##......#############......|.......\n\
+........|..##........##.........##......#.......|.......\n\
+........|..##........#..........#........#......|.......\n\
+........|...##......##.........##........#......|.......\n\
+........|...#########..........##........##.....|.......\n\
+........|.....######...........##........##.....|.......\n\
+........|......................##........#......|.......\n\
+........|.......................##......##......|.......\n\
+........|.......................#########.......|.......\n\
+........|.##################......######........|.......\n\
+........|..################.....................|.......\n\
+........|..##.......#...........................|.......\n\
+........|..#........##..........................|.......\n\
+........|.##.........#........##################|.......\n\
+........|.##.........##........################.|.......\n\
+........|.##.........##........##.......#.......|.......\n\
+........|.##........##.........#........##......|.......\n\
+........|..##......###........##.........#......|.......\n\
+........|...#########.........##.........##.....|.......\n\
+........|....######...........##.........##.....|.......\n\
+........|.....................##........##......|.......\n\
+........|......................##......###......|.......\n\
+........|.......................#########.......|.......\n\
+........|........................######.........|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......\n\
+........|.......................................|.......");
     }
 
     /// Snapshot test: `render_text` with `"Dpb\nFpb"` on 6mm tape,
-    /// top-margin=2, bottom-margin=8.  The size is `max_size_pt / 2` —
-    /// what `main.rs` now passes when `--size` is omitted and there are 2 lines.
-    /// Ink must not overflow the `|` boundaries.
+    /// top-margin=2, bottom-margin=0 (the CLI defaults).  The size is
+    /// `max_size_pt / 2` — what `main.rs` passes when `--size` is omitted
+    /// and there are 2 lines. Ink must not overflow the `|` boundaries.
     #[test]
     fn render_text_autosize_newline_fits_each_band() {
         let renderer = default_renderer();
-        let tape = TapeWidth::Mm6;
+        let tape = Tape::sr3700p(TapeWidth::Mm6);
         let top_margin = 2usize;
-        let bottom_margin = 8usize;
+        let bottom_margin = 0usize;
         let max_size = renderer.max_size_pt_for_tape(tape, top_margin, bottom_margin);
         let size = max_size / 2.0; // same as main.rs: max_size / num_lines
         let (rows, _) = renderer.render_text(
@@ -1949,113 +2179,127 @@ mod tests {
         );
         assert!(!rows.is_empty(), "expected non-empty output");
         assert_ascii_art(&rows, tape, top_margin, bottom_margin, 120, "\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|..######################.....######################..|.\n\
-........|..######################.....######################..|.\n\
-........|............###.......##.....###.................##..|.\n\
-........|.............##.......##.....###.................##..|.\n\
-........|.............##.......##.....###.................##..|.\n\
-........|.............##.......##.....###.................##..|.\n\
-........|.............##.......##.....###.................##..|.\n\
-........|.............##.......##.....###.................##..|.\n\
-........|.............##.......##.....###.................##..|.\n\
-........|.............##.......##......##.................##..|.\n\
-........|.............##.......##......##................###..|.\n\
-........|.............##.......##......###...............##...|.\n\
-........|......................##.......##..............###...|.\n\
-........|......................##.......###............###....|.\n\
-........|................................####.........####....|.\n\
-........|.................................###############.....|.\n\
-........|..................................############.......|.\n\
-........|....................................########.........|.\n\
-........|##################...................................|.\n\
-........|##################...................................|.\n\
-........|.....###......###....................................|.\n\
-........|....###........##....................................|.\n\
-........|....##..........##...................................|.\n\
-........|...##...........##.........##################........|.\n\
-........|...##............##........##################........|.\n\
-........|...##............##.............###......###.........|.\n\
-........|...##...........###............###........##.........|.\n\
-........|...###..........##.............##..........##........|.\n\
-........|....##.........###............##...........##........|.\n\
-........|....####......####............##............##.......|.\n\
-........|.....############.............##............##.......|.\n\
-........|......##########..............##...........###.......|.\n\
-........|........#####.................###..........##........|.\n\
-........|...............................##.........###........|.\n\
-........|...............................####......####........|.\n\
-........|................................############.........|.\n\
-........|.................................##########..........|.\n\
-........|..#######################..........#####.............|.\n\
-........|...######################............................|.\n\
-........|....##........##.....................................|.\n\
-........|...##..........##....................................|.\n\
-........|...##...........##...................................|.\n\
-........|..##............##...........#######################.|.\n\
-........|..##.............##...........######################.|.\n\
-........|..##.............##............##........##..........|.\n\
-........|..##............###...........##..........##.........|.\n\
-........|..###...........##............##...........##........|.\n\
-........|...##..........###...........##............##........|.\n\
-........|...####......####............##.............##.......|.\n\
-........|....############.............##.............##.......|.\n\
-........|.....##########..............##............###.......|.\n\
-........|........#####................###...........##........|.\n\
-........|..............................##..........###........|.\n\
-........|..............................####......####.........|.\n\
-........|...............................############..........|.\n\
-........|................................##########...........|.\n\
-........|...................................#####.............|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.\n\
-........|.....................................................|.");
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|..######################.....######################..|.\n\
+|..######################.....######################..|.\n\
+|............###.......##.....###.................##..|.\n\
+|.............##.......##.....###.................##..|.\n\
+|.............##.......##.....###.................##..|.\n\
+|.............##.......##.....###.................##..|.\n\
+|.............##.......##.....###.................##..|.\n\
+|.............##.......##.....###.................##..|.\n\
+|.............##.......##.....###.................##..|.\n\
+|.............##.......##......##.................##..|.\n\
+|.............##.......##......##................###..|.\n\
+|.............##.......##......###...............##...|.\n\
+|......................##.......##..............###...|.\n\
+|......................##.......###............###....|.\n\
+|................................####.........####....|.\n\
+|.................................###############.....|.\n\
+|..................................############.......|.\n\
+|....................................########.........|.\n\
+|##################...................................|.\n\
+|##################...................................|.\n\
+|.....###......###....................................|.\n\
+|....###........##....................................|.\n\
+|....##..........##...................................|.\n\
+|...##...........##.........##################........|.\n\
+|...##............##........##################........|.\n\
+|...##............##.............###......###.........|.\n\
+|...##...........###............###........##.........|.\n\
+|...###..........##.............##..........##........|.\n\
+|....##.........###............##...........##........|.\n\
+|....####......####............##............##.......|.\n\
+|.....############.............##............##.......|.\n\
+|......##########..............##...........###.......|.\n\
+|........#####.................###..........##........|.\n\
+|...............................##.........###........|.\n\
+|...............................####......####........|.\n\
+|................................############.........|.\n\
+|.................................##########..........|.\n\
+|..#######################..........#####.............|.\n\
+|...######################............................|.\n\
+|....##........##.....................................|.\n\
+|...##..........##....................................|.\n\
+|...##...........##...................................|.\n\
+|..##............##...........#######################.|.\n\
+|..##.............##...........######################.|.\n\
+|..##.............##............##........##..........|.\n\
+|..##............###...........##..........##.........|.\n\
+|..###...........##............##...........##........|.\n\
+|...##..........###...........##............##........|.\n\
+|...####......####............##.............##.......|.\n\
+|....############.............##.............##.......|.\n\
+|.....##########..............##............###.......|.\n\
+|........#####................###...........##........|.\n\
+|..............................##..........###........|.\n\
+|..............................####......####.........|.\n\
+|...............................############..........|.\n\
+|................................##########...........|.\n\
+|...................................#####.............|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.\n\
+|.....................................................|.");
     }
 
     // ---- line ratios (--line-ratios) ----
@@ -2063,7 +2307,7 @@ mod tests {
     #[test]
     fn line_sizes_ratios_auto_are_proportional() {
         let renderer = default_renderer();
-        let tape = TapeWidth::Mm18;
+        let tape = Tape::sr3700p(TapeWidth::Mm18);
         let max = renderer.max_size_pt_for_tape(tape, TapeWidth::HEAD_MARGIN_BITS, TapeWidth::HEAD_MARGIN_BITS);
         let sizes = renderer.line_sizes_for_ratios(None, &[7.0, 3.0], tape, TapeWidth::HEAD_MARGIN_BITS, TapeWidth::HEAD_MARGIN_BITS);
         assert_eq!(sizes.len(), 2);
@@ -2076,7 +2320,7 @@ mod tests {
     #[test]
     fn line_sizes_ratios_explicit_size_is_max_line() {
         let renderer = default_renderer();
-        let tape = TapeWidth::Mm18;
+        let tape = Tape::sr3700p(TapeWidth::Mm18);
         let sizes = renderer.line_sizes_for_ratios(Some(20.0), &[7.0, 3.0], tape, TapeWidth::HEAD_MARGIN_BITS, TapeWidth::HEAD_MARGIN_BITS);
         // --size is the largest-ratio line's size; others scale by r/max(r).
         assert!((sizes[0] - 20.0).abs() < 0.001);
@@ -2086,7 +2330,7 @@ mod tests {
     #[test]
     fn line_sizes_ratios_equal_matches_legacy() {
         let renderer = default_renderer();
-        let tape = TapeWidth::Mm18;
+        let tape = Tape::sr3700p(TapeWidth::Mm18);
         let max = renderer.max_size_pt_for_tape(tape, TapeWidth::HEAD_MARGIN_BITS, TapeWidth::HEAD_MARGIN_BITS);
         let sizes = renderer.line_sizes_for_ratios(None, &[1.0, 1.0], tape, TapeWidth::HEAD_MARGIN_BITS, TapeWidth::HEAD_MARGIN_BITS);
         assert!((sizes[0] - max / 2.0).abs() < 0.01);
@@ -2112,7 +2356,7 @@ mod tests {
     #[test]
     fn render_ratios_rejects_bad_input() {
         let renderer = default_renderer();
-        let tape = TapeWidth::Mm18;
+        let tape = Tape::sr3700p(TapeWidth::Mm18);
         let m = TapeWidth::HEAD_MARGIN_BITS;
         // Count mismatch (2 lines, 1 ratio).
         assert!(renderer.render_text_ratios("A\nB", None, &[1.0], tape, 3.0, 3.0, m, m).is_err());
@@ -2129,7 +2373,7 @@ mod tests {
     /// Ink span (max-min+1 of inked bit positions) within the bit range
     /// that corresponds to head-bit rows `[head_start, head_end)`.
     /// Bit positions are mirrored: bit = head_offset + (head_bits-1-row).
-    fn band_ink_span(rows: &[Vec<u8>], tape: TapeWidth, head_start: usize, head_end: usize) -> usize {
+    fn band_ink_span(rows: &[Vec<u8>], tape: Tape, head_start: usize, head_end: usize) -> usize {
         let ho = tape.head_offset();
         let hb = tape.head_bits();
         let bit_lo = ho + hb - head_end;
@@ -2157,7 +2401,7 @@ mod tests {
         // With all ratios equal, the ratio path must produce byte-identical
         // rows to the legacy path at the auto per-line size (max / 2).
         let renderer = default_renderer();
-        let tape = TapeWidth::Mm18;
+        let tape = Tape::sr3700p(TapeWidth::Mm18);
         let m = TapeWidth::HEAD_MARGIN_BITS;
         let max = renderer.max_size_pt_for_tape(tape, m, m);
         let (legacy, _) = renderer.render_text(
@@ -2178,7 +2422,7 @@ mod tests {
         // and the long second line shrinks so the whole label gets
         // shorter than the equal-ratio rendering.
         let renderer = default_renderer();
-        let tape = TapeWidth::Mm18;
+        let tape = Tape::sr3700p(TapeWidth::Mm18);
         let m = TapeWidth::HEAD_MARGIN_BITS;
         let hb = tape.head_bits();
 
@@ -2278,7 +2522,7 @@ mod tests {
     #[test]
     fn frame_on_rendered_text_adds_ink_and_keeps_size() {
         let renderer = default_renderer();
-        let tape = TapeWidth::Mm18;
+        let tape = Tape::sr3700p(TapeWidth::Mm18);
         let (rows, margin) = renderer.render_text(
             "Frame", 24.0, tape, 3.0, 3.0,
             TapeWidth::HEAD_MARGIN_BITS, TapeWidth::HEAD_MARGIN_BITS,

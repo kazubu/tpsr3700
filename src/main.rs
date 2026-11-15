@@ -1,13 +1,14 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
-use tpsr3700::font::{FontRenderer, TextAlign, DEFAULT_FONT_BYTES, DEFAULT_FEED_MARGIN_MM};
-use tpsr3700::tepra::builder::build_print_job;
-use tpsr3700::tepra::TapeWidth;
+use tpsr3700::font::{FontRenderer, TextAlign, DEFAULT_FONT_BYTES, DEFAULT_LEFT_MARGIN_MM, DEFAULT_RIGHT_MARGIN_MM};
+use tpsr3700::tepra::builder::{build_print_job_multi, printer_payload, CutMode, JobOptions};
+use tpsr3700::tepra::raster::ROW_HEADER_LEN;
+use tpsr3700::tepra::{DotsSource, Model, Tape, TapeWidth};
 
 /// Parse `job` and print a human-readable summary plus an ASCII-art
 /// rendering of the raster rows to stdout.
-fn dump_explain(job: &[u8], tape: TapeWidth, top_margin: usize, bottom_margin: usize) {
+fn dump_explain(job: &[u8], tape: Tape, top_margin: usize, bottom_margin: usize, opts: JobOptions) {
     let bitmap_bytes = tape.bitmap_bytes();
     let bitmap_bits = tape.bitmap_bits();
     let head_offset = bottom_margin;
@@ -18,7 +19,12 @@ fn dump_explain(job: &[u8], tape: TapeWidth, top_margin: usize, bottom_margin: u
     println!("=== TEPRA job dump ({} bytes) ===", job.len());
     println!();
     println!("[Header block]  bytes 0-2178 (2179 bytes, fixed)");
+    println!("  model                      : {} ({} dpi, {}-dot head)", tape.model.name(), tape.model.dpi(), tape.model.head_dots());
     println!("  tape width byte (offset 8) : 0x{:02X} = {}mm", tape_mm_byte, tape_mm_byte);
+    println!("  aux byte (offset 23)       : 0x{:02X}", job[23]);
+    println!("  model byte (offset 9)      : 0x{:02X}", job[9]);
+    println!("  cut mode (C params)        : {} {:02X?}", opts.cut.name(), opts.cut.c_params());
+    println!("  copies                     : {} (first copy shown below)", opts.copies.max(1));
 
     // ---- Config commands ----
     // Frame layout: ESC { <len> <cmd> <params…> <checksum> }
@@ -43,15 +49,19 @@ fn dump_explain(job: &[u8], tape: TapeWidth, top_margin: usize, bottom_margin: u
     println!("  T (margin rows): {}", margin_rows);
 
     // ---- Raster rows ----
-    let row_len = 7 + bitmap_bytes; // ESC . 00 0D 0D 01 <width_byte> <bitmap>
+    let row_len = ROW_HEADER_LEN + bitmap_bytes; // ESC . 00 0D 0D 01 <dots u16 LE> <bitmap>
     let raster_start = HEADER_LEN + cmd_c_len + cmd_d_len + cmd_g_len + cmd_l_len + cmd_t_len;
 
     println!();
     println!(
-        "[Raster rows]  {} rows × {} bitmap bytes ({} bits, printable: bits {}..{})",
+        "[Raster rows]  {} rows × {} bitmap bytes ({} dots{}, printable: bits {}..{})",
         row_count,
         bitmap_bytes,
         bitmap_bits,
+        match tape.dots_source() {
+            DotsSource::Captured => "",
+            DotsSource::Extrapolated => ", extrapolated",
+        },
         head_offset,
         head_offset + head_bits - 1,
     );
@@ -60,7 +70,7 @@ fn dump_explain(job: &[u8], tape: TapeWidth, top_margin: usize, bottom_margin: u
     let mut bitmaps: Vec<&[u8]> = Vec::new();
     for i in 0..row_count as usize {
         let start = raster_start + i * row_len;
-        bitmaps.push(&job[start + 7..start + 7 + bitmap_bytes]);
+        bitmaps.push(&job[start + ROW_HEADER_LEN..start + ROW_HEADER_LEN + bitmap_bytes]);
     }
 
     // Per-bit ink counts (for summary).
@@ -95,6 +105,14 @@ struct Args {
     /// Text to print.
     text: Option<String>,
 
+    /// Print several labels as one job: a file containing the labels
+    /// separated by ASCII RS (0x1E) characters (newlines inside a label
+    /// are kept). TEXT must be omitted. Every label is rendered with
+    /// the same settings; --copies applies to each label and --cut
+    /// between all of them, so half cut gives one strip of labels.
+    #[arg(long, value_name = "PATH", conflicts_with = "text")]
+    labels_file: Option<PathBuf>,
+
     /// USB vendor ID override (hex, e.g. 0d8a). Defaults to the
     /// TEPRA_USB_VID env var, or the SR3700P's 0d8a. Useful for other
     /// TEPRA PRO models such as the SR3900P: find the IDs with `lsusb`
@@ -106,6 +124,14 @@ struct Args {
     /// TEPRA_USB_PID env var, or the SR3700P's 0103.
     #[arg(long)]
     pid: Option<String>,
+
+    /// Printer model: sr3700p (270 dpi, 192-dot head; the default) or
+    /// sr3900p (360 dpi, 384-dot head). Selects the dot pitch used for
+    /// every millimetre conversion, the number of head dots each tape
+    /// width uses, and a few model-identifying bytes in the job.
+    /// Defaults to the TEPRA_MODEL env var when set.
+    #[arg(long)]
+    model: Option<Model>,
 
     /// Write an SVG preview of the job to this path and exit without
     /// printing and without prompting. The SVG is rendered from the
@@ -121,7 +147,7 @@ struct Args {
     /// Output: {"tape_mm": 18, "index": 4, "supported": true}
     /// `index` is the raw tape width index reported by the printer
     /// (see docs/protocol.md section 1.5). `supported` is false when the
-    /// loaded width isn't supported by this driver (e.g. 9mm/36mm); in
+    /// loaded width isn't supported by this driver (50mm); in
     /// that case `tape_mm` is the nominal width for the index, or null
     /// if the index itself is unknown. If no printer is found, an error
     /// naming the vendor/product IDs that were searched for is printed
@@ -130,7 +156,7 @@ struct Args {
     detect_tape: bool,
 
 
-    /// Tape width in millimeters (6, 12, 18, and experimental 24 are supported).
+    /// Tape width in millimeters (4, 6, 9, 12, 18, 24, 36).
     /// If omitted, the width is auto-detected by querying the printer
     /// (requires the printer to be connected; incompatible with
     /// --no-print).
@@ -155,28 +181,58 @@ struct Args {
     /// its proportional band (equal ratios = the traditional
     /// max/lines in equal bands).
     ///
-    /// Cannot be combined with --max-tape-length-mm (wrap mode): ratios
-    /// apply only to explicit '\n'-separated lines.
+    /// With --max-tape-length-mm the label is exactly that long and each
+    /// line is aligned (--align) inside it; the text is never wrapped,
+    /// so it is an error if the widest line does not fit between the
+    /// margins.
     #[arg(long)]
     line_ratios: Option<String>,
 
     /// Blank tape feed margin (in millimeters) added before the printed
     /// content (left side when the label exits the printer).
-    #[arg(long, default_value_t = 10.0)]
+    #[arg(long, default_value_t = DEFAULT_LEFT_MARGIN_MM)]
     left_margin_mm: f32,
 
     /// Blank tape feed margin (in millimeters) added after the printed
     /// content (right side).
-    #[arg(long, default_value_t = DEFAULT_FEED_MARGIN_MM)]
+    #[arg(long, default_value_t = DEFAULT_RIGHT_MARGIN_MM)]
     right_margin_mm: f32,
 
-    /// Non-printing margin at the top edge of the tape, in dots.
+    /// Non-printing margin at the top edge of the tape, in dots (360 dpi).
     #[arg(long, default_value_t = 2)]
     top_margin: usize,
 
-    /// Non-printing margin at the bottom edge of the tape, in dots.
-    #[arg(long, default_value_t = 8)]
+    /// Non-printing margin at the bottom edge of the tape, in dots (360 dpi).
+    #[arg(long, default_value_t = 0)]
     bottom_margin: usize,
+
+    /// How to cut the tape: full (cut through, the default), half (cut
+    /// the tape but not the backing paper), or none.
+    #[arg(long, default_value = "full")]
+    cut: CutMode,
+
+    /// Number of identical labels to print in this job (1-99). Copies
+    /// are sent as one job and cut apart according to --cut.
+    #[arg(long, default_value_t = 1)]
+    copies: u32,
+
+    /// Also send the 2179-byte header block to the printer. The Windows
+    /// driver does not (it only writes it to FILE: ports), and sending it
+    /// makes the SR3900P wait ~20s before printing; this is only for
+    /// experiments.
+    #[arg(long)]
+    send_header: bool,
+
+    /// Skip the USB printer-class SOFT_RESET that is normally issued
+    /// right before the job (the Windows driver always issues it).
+    #[arg(long)]
+    no_soft_reset: bool,
+
+    /// After sending, poll the printer status every 500ms and return
+    /// only when it is idle again (prints status changes to stderr).
+    /// Prevents the next job from being sent while this one prints.
+    #[arg(long)]
+    wait: bool,
 
     /// Total label length in millimeters, including left and right feed
     /// margins.  When the text does not fit on one line at the chosen font
@@ -187,8 +243,9 @@ struct Args {
     #[arg(long)]
     max_tape_length_mm: Option<f32>,
 
-    /// Horizontal alignment of each line within the label length.
-    /// Only meaningful when --max-tape-length-mm is set.
+    /// Horizontal alignment of each line: within the label length with
+    /// --max-tape-length-mm, otherwise within the widest line of a
+    /// multi-line text (no effect on single-line text).
     /// Allowed values: left (default), center, right.
     #[arg(long, default_value = "left")]
     align: TextAlign,
@@ -255,7 +312,7 @@ fn open_printer(args: &Args) -> Result<tpsr3700::usb::Printer> {
 /// index mapping in docs/protocol.md section 1.5
 /// (`[4, 6, 9, 12, 18, 24, 36, 50]` mm for indices 0..=7). Returns
 /// `None` for indices outside that table. This exists so widths the
-/// driver cannot print to yet (9mm, 36mm, ...) can still be reported
+/// driver cannot print to (50mm) can still be reported
 /// by name in `--detect-tape` output.
 fn nominal_mm_for_detected_index(index: u8) -> Option<u8> {
     match index {
@@ -324,14 +381,27 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let text = args
-        .text
-        .clone()
-        .map(|t| t.replace("\\n", "\n"))
-        .unwrap_or_default();
-    if args.text.is_none() {
-        anyhow::bail!("nothing to print: pass TEXT");
-    }
+    let labels: Vec<String> = match &args.labels_file {
+        Some(path) => {
+            let content = std::fs::read_to_string(path)
+                .with_context(|| format!("failed to read --labels-file {}", path.display()))?;
+            let labels: Vec<String> = content
+                .split('\x1e')
+                .map(|s| s.to_string())
+                .filter(|s| !s.trim().is_empty())
+                .collect();
+            if labels.is_empty() {
+                anyhow::bail!("--labels-file {} contains no labels", path.display());
+            }
+            labels
+        }
+        None => match &args.text {
+            Some(t) => vec![t.replace("\\n", "\n")],
+            None => anyhow::bail!("nothing to print: pass TEXT or --labels-file"),
+        },
+    };
+    // The first label stands in for the job in previews and dumps.
+    let text = labels[0].clone();
 
     // Open the printer early if we might need it, either for tape width
     // auto-detection or for actually sending the job, so both can share
@@ -342,13 +412,26 @@ fn main() -> Result<()> {
         None
     };
 
-    let tape = match args.tape_mm {
+    let model = match &args.model {
+        Some(m) => *m,
+        None => match std::env::var("TEPRA_MODEL") {
+            Ok(s) if !s.trim().is_empty() => s
+                .parse::<Model>()
+                .map_err(|e| anyhow::anyhow!("TEPRA_MODEL: {e}"))?,
+            _ => Model::default(),
+        },
+    };
+
+    let width = match args.tape_mm {
+        Some(4) => TapeWidth::Mm4,
         Some(6) => TapeWidth::Mm6,
+        Some(9) => TapeWidth::Mm9,
         Some(12) => TapeWidth::Mm12,
         Some(18) => TapeWidth::Mm18,
         Some(24) => TapeWidth::Mm24,
+        Some(36) => TapeWidth::Mm36,
         Some(other) => {
-            anyhow::bail!("unsupported tape width: {other}mm (only 6, 12, 18, and experimental 24 are supported)")
+            anyhow::bail!("unsupported tape width: {other}mm (only 4, 6, 9, 12, 18, 24, and 36 are supported)")
         }
         None => {
             let printer = printer
@@ -356,19 +439,33 @@ fn main() -> Result<()> {
                 .expect("printer connection opened above when --tape-mm is omitted");
             let (detected, index) = printer.get_tape_width_with_index()?;
             match detected {
-                Some(tape) => {
-                    eprintln!("detected {}mm tape loaded in printer", tape.width_mm());
-                    tape
+                Some(width) => {
+                    eprintln!("detected {}mm tape loaded in printer", width.width_mm());
+                    width
                 }
                 None => anyhow::bail!(
                     "detected tape width index {index} from the printer, but this width \
-                     isn't supported yet (only 6, 12, 18, and experimental 24mm are); pass --tape-mm explicitly \
+                     isn't supported (only 4, 6, 9, 12, 18, 24, and 36mm are); pass --tape-mm explicitly \
                      if you know the width, or see docs/protocol.md section 1.5 for the index \
                      mapping"
                 ),
             }
         }
     };
+
+    let tape = width.on(model);
+    if tape.dots_source() == DotsSource::Extrapolated {
+        eprintln!(
+            "warning: {}mm tape on the {} has not been captured from the official driver; \
+             the raster geometry ({} dots) is extrapolated. Capture w{}_full.prn with the {} \
+             driver (see capture-kit/README.md) to confirm it.",
+            tape.width_mm(),
+            tape.model.name(),
+            tape.dots(),
+            tape.width_mm(),
+            tape.model.name()
+        );
+    }
 
     let renderer = match &args.font {
         Some(path) => FontRenderer::load(path)?,
@@ -380,14 +477,132 @@ fn main() -> Result<()> {
         Some(s) => Some(parse_line_ratios(s)?),
         None => None,
     };
-    if line_ratios.is_some() && args.max_tape_length_mm.is_some() {
-        anyhow::bail!(
-            "--line-ratios cannot be combined with --max-tape-length-mm (wrap mode); \
-             ratios apply only to explicit newline-separated lines"
-        );
+    if !(1..=3).contains(&args.frame_width) {
+        anyhow::bail!("--frame-width must be between 1 and 3, got {}", args.frame_width);
+    }
+    if !(1..=99).contains(&args.copies) {
+        anyhow::bail!("--copies must be between 1 and 99, got {}", args.copies);
     }
 
-    let (rows, margin) = if let Some(ratios) = &line_ratios {
+    let rendered: Vec<(Vec<Vec<u8>>, u32)> = labels
+        .iter()
+        .map(|t| render_label(&renderer, &args, tape, line_ratios.as_deref(), t))
+        .collect::<Result<_>>()?;
+    let (rows, margin) = (&rendered[0].0, rendered[0].1);
+
+    let job_opts = JobOptions { cut: args.cut, copies: args.copies };
+    let char_count = text.chars().count() as u32;
+    let label_refs: Vec<(&[Vec<u8>], u32)> = rendered.iter().map(|(r, m)| (r.as_slice(), *m)).collect();
+    let job = build_print_job_multi(tape, char_count, &label_refs, job_opts);
+    if labels.len() > 1 {
+        eprintln!("{} labels in one job ({} bytes)", labels.len(), job.len());
+    }
+
+    if let Some(path) = &args.dump {
+        std::fs::write(path, &job)?;
+        eprintln!("wrote {} bytes to {}", job.len(), path.display());
+        dump_explain(&job, tape, args.top_margin, args.bottom_margin, job_opts);
+    }
+
+    // --preview-out: write the SVG preview (rendered from the exact
+    // raster rows that would be printed) and exit. Never prompts and
+    // never sends the job to the printer. With several labels only the
+    // first one is previewed.
+    if let Some(path) = &args.preview_out {
+        #[cfg(feature = "preview")]
+        {
+            let right_margin_rows = tape.mm_to_rows(args.right_margin_mm);
+            let svg = tpsr3700::preview::build_svg_preview(
+                rows,
+                tape,
+                &text,
+                args.top_margin,
+                args.bottom_margin,
+                margin,
+                right_margin_rows,
+            );
+            std::fs::write(path, svg)?;
+            eprintln!("preview written to {}", path.display());
+            return Ok(());
+        }
+        #[cfg(not(feature = "preview"))]
+        {
+            anyhow::bail!("--preview-out requires the crate to be built with the `preview` feature");
+        }
+    }
+
+    if !args.skip_preview {
+        #[cfg(feature = "preview")]
+        {
+            let right_margin_rows = tape.mm_to_rows(args.right_margin_mm);
+            match tpsr3700::preview::show_preview(
+                rows,
+                tape,
+                &text,
+                args.top_margin,
+                args.bottom_margin,
+                margin,
+                right_margin_rows,
+            )? {
+                tpsr3700::preview::PreviewResult::Print => {}
+                tpsr3700::preview::PreviewResult::Cancel => {
+                    eprintln!("cancelled by user in preview; not printing.");
+                    return Ok(());
+                }
+            }
+        }
+        #[cfg(not(feature = "preview"))]
+        {
+            anyhow::bail!(
+                "the print preview requires the crate to be built with the \
+                 `preview` feature; pass --skip-preview to print without previewing"
+            );
+        }
+    }
+
+    if !args.no_print {
+        let printer = printer
+            .as_mut()
+            .expect("printer connection opened above when --no-print is not set");
+        // Same sequence as the SR3900P Windows driver (docs/protocol.md
+        // section 1.6): SOFT_RESET, bulk-write the job without the
+        // header block, then poll the status until idle.
+        if !args.no_soft_reset {
+            printer.soft_reset()?;
+        }
+        let payload = if args.send_header { &job[..] } else { printer_payload(&job) };
+        let t0 = std::time::Instant::now();
+        printer.send_job(payload)?;
+        eprintln!(
+            "sent job to printer ({} bytes{}) in {:.2}s",
+            payload.len(),
+            if args.send_header { ", including header" } else { "" },
+            t0.elapsed().as_secs_f32()
+        );
+        if args.wait {
+            let st = printer.wait_until_idle(
+                std::time::Duration::from_secs(180 + 30 * labels.len() as u64),
+                std::time::Duration::from_secs(5),
+                |st| eprintln!("[{:.1}s] status {:02x?}", t0.elapsed().as_secs_f32(), st.raw),
+            )?;
+            eprintln!("printer idle after {:.1}s (status {:02x?})", t0.elapsed().as_secs_f32(), st.raw);
+        }
+    }
+
+    Ok(())
+}
+
+/// Renders one label's text with the CLI's layout settings (size,
+/// ratios, wrap length, alignment, margins, frame) into raster rows and
+/// the leading-margin row count.
+fn render_label(
+    renderer: &FontRenderer,
+    args: &Args,
+    tape: Tape,
+    line_ratios: Option<&[f32]>,
+    text: &str,
+) -> Result<(Vec<Vec<u8>>, u32)> {
+    let (rows, margin) = if let Some(ratios) = line_ratios {
         // With ratios, --size (when given) is the largest-ratio line's
         // size, so the existing would_clip warning on it bounds every
         // line.
@@ -401,8 +616,8 @@ fn main() -> Result<()> {
                 );
             }
         }
-        renderer.render_text_ratios(
-            &text,
+        renderer.render_text_ratios_aligned(
+            text,
             args.size,
             ratios,
             tape,
@@ -410,6 +625,8 @@ fn main() -> Result<()> {
             args.right_margin_mm,
             args.top_margin,
             args.bottom_margin,
+            args.align,
+            args.max_tape_length_mm,
         )?
     } else if let Some(tape_length_mm) = args.max_tape_length_mm {
         // Multi-line mode: wrap text to fit the specified tape length.
@@ -430,7 +647,7 @@ fn main() -> Result<()> {
             None => None,
         };
         renderer.render_text_multiline(
-            &text,
+            text,
             size,
             tape,
             args.left_margin_mm,
@@ -466,16 +683,13 @@ fn main() -> Result<()> {
                 size
             }
         };
-        renderer.render_text(&text, size, tape, args.left_margin_mm, args.right_margin_mm, args.top_margin, args.bottom_margin)
+        renderer.render_text_aligned(text, size, tape, args.left_margin_mm, args.right_margin_mm, args.top_margin, args.bottom_margin, args.align)
     };
 
     // Optional frame: post-process the rendered rows so the same
     // frame appears in the print job and in every preview path.
-    let (mut rows, margin) = (rows, margin);
+    let mut rows = rows;
     if args.frame {
-        if !(1..=3).contains(&args.frame_width) {
-            anyhow::bail!("--frame-width must be between 1 and 3, got {}", args.frame_width);
-        }
         tpsr3700::font::apply_frame(
             &mut rows,
             tape.bitmap_bits(),
@@ -484,80 +698,7 @@ fn main() -> Result<()> {
             args.frame_width,
         );
     }
-
-    let char_count = text.chars().count() as u32;
-    let job = build_print_job(tape, char_count, &rows, margin);
-
-    if let Some(path) = &args.dump {
-        std::fs::write(path, &job)?;
-        eprintln!("wrote {} bytes to {}", job.len(), path.display());
-        dump_explain(&job, tape, args.top_margin, args.bottom_margin);
-    }
-
-    // --preview-out: write the SVG preview (rendered from the exact
-    // raster rows that would be printed) and exit. Never prompts and
-    // never sends the job to the printer.
-    if let Some(path) = &args.preview_out {
-        #[cfg(feature = "preview")]
-        {
-            let right_margin_rows = tpsr3700::font::mm_to_rows(args.right_margin_mm);
-            let svg = tpsr3700::preview::build_svg_preview(
-                &rows,
-                tape,
-                &text,
-                args.top_margin,
-                args.bottom_margin,
-                margin,
-                right_margin_rows,
-            );
-            std::fs::write(path, svg)?;
-            eprintln!("preview written to {}", path.display());
-            return Ok(());
-        }
-        #[cfg(not(feature = "preview"))]
-        {
-            anyhow::bail!("--preview-out requires the crate to be built with the `preview` feature");
-        }
-    }
-
-    if !args.skip_preview {
-        #[cfg(feature = "preview")]
-        {
-            let right_margin_rows = tpsr3700::font::mm_to_rows(args.right_margin_mm);
-            match tpsr3700::preview::show_preview(
-                &rows,
-                tape,
-                &text,
-                args.top_margin,
-                args.bottom_margin,
-                margin,
-                right_margin_rows,
-            )? {
-                tpsr3700::preview::PreviewResult::Print => {}
-                tpsr3700::preview::PreviewResult::Cancel => {
-                    eprintln!("cancelled by user in preview; not printing.");
-                    return Ok(());
-                }
-            }
-        }
-        #[cfg(not(feature = "preview"))]
-        {
-            anyhow::bail!(
-                "the print preview requires the crate to be built with the \
-                 `preview` feature; pass --skip-preview to print without previewing"
-            );
-        }
-    }
-
-    if !args.no_print {
-        let printer = printer
-            .as_mut()
-            .expect("printer connection opened above when --no-print is not set");
-        printer.send_job(&job)?;
-        eprintln!("sent job to printer ({} bytes)", job.len());
-    }
-
-    Ok(())
+    Ok((rows, margin))
 }
 
 #[cfg(test)]
@@ -593,16 +734,28 @@ mod tests {
     }
 
     #[test]
-    fn detect_json_unsupported_width_reports_nominal_mm() {
-        // 9mm (index 2) and 36mm (index 6) are real widths the driver
-        // cannot print to yet; they must still be reported by name.
+    fn detect_json_9mm_and_36mm_are_supported() {
         assert_eq!(
-            detect_tape_json(None, 2),
-            "{\"tape_mm\": 9, \"index\": 2, \"supported\": false}"
+            detect_tape_json(Some(TapeWidth::Mm9), 2),
+            "{\"tape_mm\": 9, \"index\": 2, \"supported\": true}"
         );
         assert_eq!(
-            detect_tape_json(None, 6),
-            "{\"tape_mm\": 36, \"index\": 6, \"supported\": false}"
+            detect_tape_json(Some(TapeWidth::Mm36), 6),
+            "{\"tape_mm\": 36, \"index\": 6, \"supported\": true}"
+        );
+    }
+
+    #[test]
+    fn detect_json_unsupported_width_reports_nominal_mm() {
+        // 50mm (index 7) is a real width the driver cannot print to; it
+        // must still be reported by name.
+        assert_eq!(
+            detect_tape_json(Some(TapeWidth::Mm4), 0),
+            "{\"tape_mm\": 4, \"index\": 0, \"supported\": true}"
+        );
+        assert_eq!(
+            detect_tape_json(None, 7),
+            "{\"tape_mm\": 50, \"index\": 7, \"supported\": false}"
         );
     }
 
