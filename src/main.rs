@@ -223,6 +223,18 @@ struct Args {
     #[arg(long, default_value = "full")]
     cut: CutMode,
 
+    /// Lay the text out for a cable-marking label: restrict printing to
+    /// the printable band at the top of the tape (24mm: top 8mm, 36mm:
+    /// top 13mm), leaving the rest clear to wrap around the cable. Only
+    /// 24mm and 36mm tape have a cable-marking variant.
+    #[arg(long)]
+    cable: bool,
+
+    /// Height of the cable label's printable area in millimetres,
+    /// overriding the default for the tape width. Only with --cable.
+    #[arg(long, value_name = "MM", requires = "cable")]
+    cable_mm: Option<f32>,
+
     /// Number of identical labels to print in this job (1-99). Copies
     /// are sent as one job and cut apart according to --cut.
     #[arg(long, default_value_t = 1)]
@@ -536,6 +548,9 @@ fn main() -> Result<()> {
     if !(1..=99).contains(&args.copies) {
         anyhow::bail!("--copies must be between 1 and 99, got {}", args.copies);
     }
+    // Cable labels print only in a band at the top of the tape, which is
+    // expressed as a larger bottom margin (see effective_margins).
+    let (top_margin, bottom_margin) = effective_margins(&args, tape)?;
 
     let rendered: Vec<(Vec<Vec<u8>>, u32)> = match args.feed_mm {
         Some(mm) => {
@@ -554,7 +569,7 @@ fn main() -> Result<()> {
         }
         None => labels
             .iter()
-            .map(|t| render_label(&renderer, &args, tape, line_ratios.as_deref(), t))
+            .map(|t| render_label(&renderer, &args, tape, line_ratios.as_deref(), t, top_margin, bottom_margin))
             .collect::<Result<_>>()?,
     };
     let (rows, margin) = (&rendered[0].0, rendered[0].1);
@@ -570,7 +585,7 @@ fn main() -> Result<()> {
     if let Some(path) = &args.dump {
         std::fs::write(path, &job)?;
         eprintln!("wrote {} bytes to {}", job.len(), path.display());
-        dump_explain(&job, tape, args.top_margin, args.bottom_margin, job_opts);
+        dump_explain(&job, tape, top_margin, bottom_margin, job_opts);
     }
 
     // --preview-out: write the SVG preview (rendered from the exact
@@ -585,8 +600,8 @@ fn main() -> Result<()> {
                 rows,
                 tape,
                 &text,
-                args.top_margin,
-                args.bottom_margin,
+                top_margin,
+                bottom_margin,
                 margin,
                 right_margin_rows,
             );
@@ -608,8 +623,8 @@ fn main() -> Result<()> {
                 rows,
                 tape,
                 &text,
-                args.top_margin,
-                args.bottom_margin,
+                top_margin,
+                bottom_margin,
                 margin,
                 right_margin_rows,
             )? {
@@ -664,20 +679,54 @@ fn main() -> Result<()> {
 /// Renders one label's text with the CLI's layout settings (size,
 /// ratios, wrap length, alignment, margins, frame) into raster rows and
 /// the leading-margin row count.
+/// The top/bottom non-printing margins to render with, in dots. In
+/// cable mode the printable band is reduced to the top `cable_mm` of the
+/// tape by pushing the bottom margin up, so the text lands on the
+/// label's printable area and the rest stays clear.
+fn effective_margins(args: &Args, tape: Tape) -> Result<(usize, usize)> {
+    if !args.cable {
+        return Ok((args.top_margin, args.bottom_margin));
+    }
+    let mm = match args.cable_mm.or_else(|| tape.width.cable_printable_mm()) {
+        Some(mm) => mm,
+        None => anyhow::bail!(
+            "--cable needs a tape width with a cable-marking variant (24mm or 36mm), got {}mm; \
+             pass --cable-mm to set the printable height explicitly",
+            tape.width_mm()
+        ),
+    };
+    let usable = tape.mm_to_rows(mm) as usize;
+    let total = tape.bitmap_bits();
+    if usable == 0 || args.top_margin + usable > total {
+        anyhow::bail!(
+            "cable printable height {mm}mm does not fit on {}mm tape (at most {:.1}mm)",
+            tape.width_mm(),
+            tape.rows_to_mm((total - args.top_margin) as u32)
+        );
+    }
+    let bottom = total - args.top_margin - usable;
+    eprintln!(
+        "cable label: printing in the top {mm}mm of the tape ({usable} dots), rest left clear"
+    );
+    Ok((args.top_margin, bottom))
+}
+
 fn render_label(
     renderer: &FontRenderer,
     args: &Args,
     tape: Tape,
     line_ratios: Option<&[f32]>,
     text: &str,
+    top_margin: usize,
+    bottom_margin: usize,
 ) -> Result<(Vec<Vec<u8>>, u32)> {
     let (rows, margin) = if let Some(ratios) = line_ratios {
         // With ratios, --size (when given) is the largest-ratio line's
         // size, so the existing would_clip warning on it bounds every
         // line.
         if let Some(size) = args.size {
-            if renderer.would_clip(size, tape, args.top_margin, args.bottom_margin) {
-                let max = renderer.max_size_pt_for_tape(tape, args.top_margin, args.bottom_margin);
+            if renderer.would_clip(size, tape, top_margin, bottom_margin) {
+                let max = renderer.max_size_pt_for_tape(tape, top_margin, bottom_margin);
                 eprintln!(
                     "warning: {size}pt may be too large for {}mm tape and could be \
                      clipped at the top/bottom; try --size {max:.1} or smaller",
@@ -692,8 +741,8 @@ fn render_label(
             tape,
             args.left_margin_mm,
             args.right_margin_mm,
-            args.top_margin,
-            args.bottom_margin,
+            top_margin,
+            bottom_margin,
             args.align,
             args.max_tape_length_mm,
         )?
@@ -703,8 +752,8 @@ fn render_label(
             Some(size) => {
                 // Validate manually since would_clip is tape-width-based,
                 // but the per-band check happens inside render_text_multiline.
-                if renderer.would_clip(size, tape, args.top_margin, args.bottom_margin) {
-                    let max = renderer.max_size_pt_for_tape(tape, args.top_margin, args.bottom_margin);
+                if renderer.would_clip(size, tape, top_margin, bottom_margin) {
+                    let max = renderer.max_size_pt_for_tape(tape, top_margin, bottom_margin);
                     eprintln!(
                         "warning: {size}pt may be too large for {}mm tape and could be \
                          clipped at the top/bottom; try --size {max:.1} or smaller",
@@ -723,16 +772,16 @@ fn render_label(
             args.right_margin_mm,
             tape_length_mm,
             args.align,
-            args.top_margin,
-            args.bottom_margin,
+            top_margin,
+            bottom_margin,
         )?
     } else {
         // Single-line mode, or implicit multi-line via '\n'.
         let num_lines = text.lines().count().max(1);
         let size = match args.size {
             Some(size) => {
-                if renderer.would_clip(size, tape, args.top_margin, args.bottom_margin) {
-                    let max = renderer.max_size_pt_for_tape(tape, args.top_margin, args.bottom_margin);
+                if renderer.would_clip(size, tape, top_margin, bottom_margin) {
+                    let max = renderer.max_size_pt_for_tape(tape, top_margin, bottom_margin);
                     eprintln!(
                         "warning: {size}pt may be too large for {}mm tape and could be \
                          clipped at the top/bottom; try --size {max:.1} or smaller",
@@ -742,7 +791,7 @@ fn render_label(
                 size
             }
             None => {
-                let max = renderer.max_size_pt_for_tape(tape, args.top_margin, args.bottom_margin);
+                let max = renderer.max_size_pt_for_tape(tape, top_margin, bottom_margin);
                 let size = max / num_lines as f32;
                 if num_lines > 1 {
                     eprintln!("no --size given; using {size:.1}pt ({num_lines} lines on {}mm tape)", tape.width_mm());
@@ -752,7 +801,7 @@ fn render_label(
                 size
             }
         };
-        renderer.render_text_aligned(text, size, tape, args.left_margin_mm, args.right_margin_mm, args.top_margin, args.bottom_margin, args.align)?
+        renderer.render_text_aligned(text, size, tape, args.left_margin_mm, args.right_margin_mm, top_margin, bottom_margin, args.align)?
     };
 
     // Optional frame: post-process the rendered rows so the same
@@ -762,8 +811,8 @@ fn render_label(
         tpsr3700::font::apply_frame(
             &mut rows,
             tape.bitmap_bits(),
-            args.top_margin,
-            args.bottom_margin,
+            top_margin,
+            bottom_margin,
             args.frame_width,
         );
     }

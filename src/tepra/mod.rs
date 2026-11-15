@@ -169,6 +169,19 @@ impl TapeWidth {
         }
     }
 
+    /// Height of the printable (white) area of a cable-marking label of
+    /// this width, in millimetres, measured from the top edge of the
+    /// printable band. Cable-marking tape carries the text in a band at
+    /// one end and leaves the rest clear to wrap around the cable.
+    /// `None` for widths with no cable-marking variant.
+    pub fn cable_printable_mm(self) -> Option<f32> {
+        match self {
+            TapeWidth::Mm24 => Some(8.0),
+            TapeWidth::Mm36 => Some(13.0),
+            _ => None,
+        }
+    }
+
     /// Default non-printing margin at each edge of the bitmap, in dots,
     /// for library callers that don't pick their own. The CLI uses its
     /// own (smaller) defaults; see `--top-margin` / `--bottom-margin`.
@@ -392,6 +405,15 @@ mod tests {
         assert_eq!(TapeWidth::Mm18.aux_byte(), 6);
         assert_eq!(TapeWidth::Mm24.aux_byte(), 7);
         assert_eq!(TapeWidth::Mm36.aux_byte(), 8);
+    }
+
+    #[test]
+    fn cable_printable_area() {
+        assert_eq!(TapeWidth::Mm24.cable_printable_mm(), Some(8.0));
+        assert_eq!(TapeWidth::Mm36.cable_printable_mm(), Some(13.0));
+        for w in [TapeWidth::Mm4, TapeWidth::Mm6, TapeWidth::Mm9, TapeWidth::Mm12, TapeWidth::Mm18] {
+            assert_eq!(w.cable_printable_mm(), None, "{w:?}");
+        }
     }
 
     #[test]
