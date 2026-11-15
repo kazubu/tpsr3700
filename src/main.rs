@@ -695,18 +695,29 @@ fn effective_margins(args: &Args, tape: Tape) -> Result<(usize, usize)> {
             tape.width_mm()
         ),
     };
-    let usable = tape.mm_to_rows(mm) as usize;
+    // `mm` is measured from the top edge of the tape, but the head is
+    // narrower than the tape and cannot reach the outermost dots, so the
+    // usable part of the printable area is shorter by that unreachable
+    // margin. Place the band so its lowest dot is the last one inside
+    // the printable area.
     let total = tape.bitmap_bits();
-    if usable == 0 || args.top_margin + usable > total {
+    let unreachable_top = tape.unreachable_edge_dots();
+    let printable = tape.mm_to_rows(mm) as usize;
+    let bottom = (unreachable_top + total).saturating_sub(printable);
+    if printable <= unreachable_top + args.top_margin || bottom >= total - args.top_margin {
         anyhow::bail!(
-            "cable printable height {mm}mm does not fit on {}mm tape (at most {:.1}mm)",
+            "cable printable height {mm}mm leaves nothing to print on {}mm tape: the print \
+             head cannot reach the top {:.1}mm of the tape",
             tape.width_mm(),
-            tape.rows_to_mm((total - args.top_margin) as u32)
+            tape.rows_to_mm(unreachable_top as u32)
         );
     }
-    let bottom = total - args.top_margin - usable;
+    let usable = total - args.top_margin - bottom;
     eprintln!(
-        "cable label: printing in the top {mm}mm of the tape ({usable} dots), rest left clear"
+        "cable label: printable area is the top {mm}mm of the tape; the head cannot reach its \
+         top {:.1}mm, so printing in the remaining {:.1}mm ({usable} dots)",
+        tape.rows_to_mm(unreachable_top as u32),
+        tape.rows_to_mm(usable as u32)
     );
     Ok((args.top_margin, bottom))
 }

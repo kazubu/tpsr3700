@@ -347,6 +347,20 @@ impl Tape {
         TapeWidth::HEAD_MARGIN_BITS
     }
 
+    /// Full width of the physical tape in dots at this model's pitch.
+    pub fn tape_dots(self) -> usize {
+        self.mm_to_rows(self.width_mm() as f32) as usize
+    }
+
+    /// Dots at each edge of the tape that the print head cannot reach.
+    /// The head is narrower than the tape (e.g. 288 dots = 20.3mm on
+    /// 24mm tape) and sits centred on it, so this much of each edge is
+    /// never printed. Anything measured from the tape's edge has to
+    /// subtract it to land in the head's reach.
+    pub fn unreachable_edge_dots(self) -> usize {
+        self.tape_dots().saturating_sub(self.bitmap_bits()) / 2
+    }
+
     /// Converts a length in millimeters to a number of raster rows (feed
     /// direction dots) at this model's dot pitch.
     pub fn mm_to_rows(self, mm: f32) -> u32 {
@@ -410,6 +424,26 @@ mod tests {
         assert_eq!(TapeWidth::Mm18.aux_byte(), 6);
         assert_eq!(TapeWidth::Mm24.aux_byte(), 7);
         assert_eq!(TapeWidth::Mm36.aux_byte(), 8);
+    }
+
+    #[test]
+    fn unreachable_edge_is_half_the_overhang() {
+        // The head is narrower than the tape, so each edge has a band it
+        // cannot print. Cable labels measure from the tape edge, so this
+        // has to be subtracted (24mm: 340 tape dots - 288 head = 26).
+        let t24 = TapeWidth::Mm24.on(Model::Sr3900p);
+        assert_eq!(t24.tape_dots(), 340);
+        assert_eq!(t24.unreachable_edge_dots(), 26);
+        let t36 = TapeWidth::Mm36.on(Model::Sr3900p);
+        assert_eq!(t36.tape_dots(), 510);
+        assert_eq!(t36.unreachable_edge_dots(), 63);
+        // Never more than half the tape, for every model/width.
+        for model in Model::ALL {
+            for w in TapeWidth::ALL {
+                let t = w.on(model);
+                assert!(t.unreachable_edge_dots() * 2 <= t.tape_dots(), "{t:?}");
+            }
+        }
     }
 
     #[test]

@@ -103,7 +103,7 @@ pub fn build_svg_preview(
     // every part of the label that gets no ink is hatched so it reads as
     // "label, but not printed" rather than as a gap.
     let tape_rows = (tape.mm_to_rows(tape.width_mm() as f32) as usize).max(total_bits);
-    let band_offset = (tape_rows - total_bits) / 2;
+    let band_offset = tape.unreachable_edge_dots();
     let display_height = tape_rows.max(1);
     // Non-printing bands in tape coordinates (y grows downwards; bit 0 of
     // a row is the bottom edge of the dot band).
