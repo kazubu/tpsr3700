@@ -12,12 +12,14 @@ Print text labels directly from the command line — no Windows, no vendor softw
 
 ## Features
 
-- Print arbitrary text on 6 mm, 12 mm, and 18 mm tapes
+- Print arbitrary text on 4 / 6 / 9 / 12 / 18 / 24 / 36 mm tapes (SR3700P: 6/12/18 mm verified, others extrapolated; SR3900P: every width from driver captures, see `docs/protocol.md` §3)
+- SR3700P (270 dpi) and SR3900P (360 dpi) via `--model`
+- Full cut / half cut / no cut (`--cut`) and multiple copies per job (`--copies`)
 - Auto-detect the loaded tape width by querying the printer
 - Auto-select the largest font size that fits the tape
 - Multi-line printing via explicit `\n` line breaks — works with or without `--max-tape-length-mm`
 - Wrap-to-length: wrap text to a fixed label length, with a configurable maximum line count derived from the tape width (minimum line height: 3 mm)
-- Left / center / right alignment per line (with `--max-tape-length-mm`)
+- Left / center / right alignment per line (within the label length with `--max-tape-length-mm`, otherwise within the widest line of a multi-line text)
 - Dump the raw job bytes to a file (useful for debugging without hardware)
 - SVG print preview before sending the job to the printer (shown by default; `--skip-preview` to bypass it)
 
@@ -55,14 +57,18 @@ tpsr3700 [OPTIONS] <TEXT>
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--tape-mm <MM>` | auto-detect | Tape width in mm. Supported: `6`, `12`, `18`, and experimental `24`. Omit to query the printer. |
+| `--model <MODEL>` | `sr3700p` (or `TEPRA_MODEL`) | Printer model: `sr3700p` (270 dpi, 192-dot head) or `sr3900p` (360 dpi, 384-dot head). Sets the dot pitch for every mm conversion, the dots per tape width, and model bytes in the job. |
+| `--tape-mm <MM>` | auto-detect | Tape width in mm: `4`, `6`, `9`, `12`, `18`, `24`, `36`. Omit to query the printer. Widths not captured for the selected model print with a warning (see `docs/protocol.md` §3.1). |
+| `--cut <MODE>` | `full` | `full` (cut through), `half` (cut the tape, not the backing paper), or `none`. |
+| `--copies <N>` | `1` | Print N identical labels in one job, cut apart per `--cut`. |
+| `--labels-file <PATH>` | — | Print several different labels as one job: the file holds the labels separated by ASCII RS (0x1E). Replaces TEXT. Each label gets `--copies` copies; `--cut` applies between all of them. |
 | `--size <PT>` | auto | Font size in points (as shown in the TEPRA app, e.g. `36`). Omit for the largest size that fits. |
-| `--left-margin-mm <MM>` | `10.0` | Blank feed margin (mm) added before the printed content (left side as the label exits the printer). |
+| `--left-margin-mm <MM>` | `4.0` | Blank feed margin (mm) added before the printed content (left side as the label exits the printer). 1mm more than the right by default because the SR3900P trims the leading edge slightly. |
 | `--right-margin-mm <MM>` | `3.0` | Blank feed margin (mm) added after the printed content (right side). |
 | `--top-margin <DOTS>` | `2` | Non-printing margin at the top edge of the tape, in dots. |
-| `--bottom-margin <DOTS>` | `8` | Non-printing margin at the bottom edge of the tape, in dots. |
+| `--bottom-margin <DOTS>` | `0` | Non-printing margin at the bottom edge of the tape, in dots. |
 | `--max-tape-length-mm <MM>` | — | Total label length in mm (including margins). Enables multi-line wrapping when the text does not fit in one line. |
-| `--align <ALIGN>` | `left` | Per-line alignment: `left`, `center`, or `right`. Only meaningful with `--max-tape-length-mm`. |
+| `--align <ALIGN>` | `left` | Per-line alignment: `left`, `center`, or `right`. Within the label length with `--max-tape-length-mm`, otherwise within the widest line of a multi-line text (no effect on single-line text). |
 | `--font <PATH>` | bundled BIZ UDPゴシック | Path to a `.ttf`/`.otf`/`.ttc` font file. Overrides the bundled font. |
 | `--dump <PATH>` | — | Write the raw job bytes to a file (in addition to, or instead of, printing). |
 | `--no-print` | — | Skip sending the job to the printer. Useful with `--dump`. |
@@ -115,7 +121,7 @@ to spot.
   Each line is rendered into an equal vertical band.
 - When `--size` is omitted and the text contains `\n`, the font size is automatically divided by the number of lines so each band gets the largest size that fits.
 - When `--max-tape-length-mm` is given and the text overflows one line, the tool automatically increases the line count (up to the tape's maximum) until everything fits, wrapping character by character.
-- `--align` applies to each line independently (only meaningful with `--max-tape-length-mm`).
+- `--align` applies to each line independently (within the label length, or within the widest line when no length is given).
 
 ## USB permissions (Linux)
 
@@ -198,7 +204,9 @@ Windows も純正ソフトも不要で、コマンドラインから直接テキ
 
 ## 機能
 
-- 6 mm・12 mm・18 mm テープへの任意テキスト印刷
+- 4 / 6 / 9 / 12 / 18 / 24 / 36 mm テープへの任意テキスト印刷（SR3700P: 6/12/18 mm は実機確認済み、他は推定。SR3900P: 全幅が公式ドライバのキャプチャ由来。`docs/protocol.md` §3）
+- `--model` で SR3700P（270 dpi）/ SR3900P（360 dpi）を切り替え
+- フルカット / ハーフカット / カットなし（`--cut`）と 1 ジョブ複数枚（`--copies`）
 - プリンターへの問い合わせによるテープ幅自動検出
 - テープ幅に収まる最大フォントサイズの自動選択
 - **複数行印刷**: テキスト中の `\n` で改行 — `--max-tape-length-mm` の有無に関わらず使用可能
@@ -239,14 +247,18 @@ tpsr3700 [オプション] <テキスト>
 
 | オプション | デフォルト | 説明 |
 |-----------|-----------|------|
-| `--tape-mm <MM>` | 自動検出 | テープ幅（mm）。`6`・`12`・`18`、実験的に `24` をサポート。省略時はプリンターに問い合わせ。 |
+| `--model <MODEL>` | `sr3700p`（または `TEPRA_MODEL`） | 機種: `sr3700p`（270 dpi、192 ドット）か `sr3900p`（360 dpi、384 ドット）。mm 換算の解像度、テープ幅ごとのドット数、ジョブ内の機種バイトが切り替わる。 |
+| `--tape-mm <MM>` | 自動検出 | テープ幅（mm）: `4`・`6`・`9`・`12`・`18`・`24`・`36`。省略時はプリンターに問い合わせ。選択した機種でキャプチャ未取得の幅は警告付きで印刷（`docs/protocol.md` §3.1）。 |
+| `--cut <MODE>` | `full` | `full`（フルカット）、`half`（ハーフカット: 台紙を残す）、`none`（カットしない）。 |
+| `--copies <N>` | `1` | 同じラベルを 1 ジョブで N 枚印刷（`--cut` の設定で切り分け）。 |
+| `--labels-file <PATH>` | — | 内容の異なる複数ラベルを 1 ジョブで印刷。ファイル内のラベルは ASCII RS (0x1E) 区切り。TEXT の代わりに指定。各ラベルに `--copies`、ラベル間に `--cut` が効く。 |
 | `--size <PT>` | 自動 | フォントサイズ（ポイント、TEPRA アプリの表示と同じ。例: `36`）。省略時はテープに収まる最大サイズ。 |
-| `--left-margin-mm <MM>` | `10.0` | 印字内容の前（ラベルがプリンターから出る側＝左端）に追加する余白（mm）。 |
+| `--left-margin-mm <MM>` | `4.0` | 印字内容の前（ラベルがプリンターから出る側＝左端）に追加する余白（mm）。SR3900P は先端側が少し短く出るため、既定で右より 1mm 大きい。 |
 | `--right-margin-mm <MM>` | `3.0` | 印字内容の後（右端）に追加する余白（mm）。 |
 | `--top-margin <DOTS>` | `2` | テープ上端の非印字マージン（ドット数）。 |
-| `--bottom-margin <DOTS>` | `8` | テープ下端の非印字マージン（ドット数）。 |
+| `--bottom-margin <DOTS>` | `0` | テープ下端の非印字マージン（ドット数）。 |
 | `--max-tape-length-mm <MM>` | — | ラベル全長（mm、マージン込み）。指定すると、1 行に収まらないテキストを複数行に折り返す。 |
-| `--align <ALIGN>` | `left` | 各行の横方向揃え: `left`（左寄せ）・`center`（中央）・`right`（右寄せ）。`--max-tape-length-mm` 指定時のみ有効。 |
+| `--align <ALIGN>` | `left` | 各行の横方向揃え: `left`（左寄せ）・`center`（中央）・`right`（右寄せ）。`--max-tape-length-mm` 指定時はラベル長の中で、未指定時は複数行の最長行の中で揃える（1 行のみの場合は効果なし）。 |
 | `--font <PATH>` | バンドル済み BIZ UDPゴシック | フォントファイルのパス（`.ttf`/`.otf`/`.ttc`）。バンドルフォントを上書きします。 |
 | `--dump <PATH>` | — | 生のジョブバイト列をファイルに書き出す（印刷と併用可）。 |
 | `--no-print` | — | プリンターへの送信をスキップ。`--dump` と組み合わせて使用。 |
@@ -291,8 +303,8 @@ tpsr3700 --tape-mm 12 --no-print --skip-preview --dump job.prn "Test"
 - **テキスト中の `\n` は常に改行**として扱われます（`--max-tape-length-mm` の有無を問いません）。
   各行はテープの縦方向を等分したバンドに描画されます。
 - `--size` を省略した場合、`\n` の行数に応じてフォントサイズを自動的に分割し、各バンドに収まる最大サイズを使用します。
-- `--max-tape-length-mm` を指定した場合、1 行に収まらないテキストは自動的に行数を増やして（最大行数まで）文字単位で折り返します。
-- `--align` は各行に個別に適用されます（`--max-tape-length-mm` 使用時のみ有効）。
+- `--max-tape-length-mm` を指定した場合、1 行に収まらないテキストは自動的に行数を増やして（最大行数まで）文字単位で折り返します。`--line-ratios` と併用した場合は折り返さず、指定長の固定長ラベルに各行を `--align` で揃えます（最長行が余白の内側に収まらなければエラー）。
+- `--align` は各行に個別に適用されます（ラベル長の中、または長さ未指定なら最長行の中で揃えます）。
 
 ## USB アクセス権の設定（Linux）
 

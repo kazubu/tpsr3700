@@ -1,10 +1,19 @@
-# TEPRA PRO SR3700P Printer Protocol
+# TEPRA PRO SR3700P / SR3900P Printer Protocol
 
 This document describes the proprietary print job format used by the
-KING JIM TEPRA PRO SR3700P label printer, as reverse engineered for the
-Rust implementation in this repository. It is the result of capturing
-the raw bytes that Windows' vendor driver sends to the printer, without
-any access to official KING JIM documentation.
+KING JIM TEPRA PRO SR3700P and SR3900P label printers, as reverse
+engineered for the Rust implementation in this repository. It is the
+result of capturing the raw bytes that Windows' vendor drivers send to
+the printer, without any access to official KING JIM documentation.
+
+The two models share the job format. They differ in the print head
+(SR3700P: 270 dpi, 192 dots; SR3900P: 360 dpi, 384 dots), and therefore
+in the number of dots each tape width uses, in a few model-identifying
+bytes, and in the physical size of every "dot" quantity below. The
+SR3700P findings (6/12/18mm, hardware-verified) come from upstream; the
+SR3900P findings (9mm and 36mm, every cut mode, one and two copies)
+come from captures of the SR3900P driver taken on 2026-11-15
+(`tests/fixtures/sr3900p-*.prn`) and have not been printed yet.
 
 All findings here are empirical: derived by diffing several captured
 print jobs against each other (different text, font sizes, and tape
@@ -144,10 +153,10 @@ site). This strongly suggests the full mapping is:
 | 6     | 36mm       |
 | 7     | 50mm       |
 
-Indices 0, 2, 6, and 7 (4mm, 9mm, 36mm, 50mm) are extrapolated from
-the lineup pattern and have **not** been confirmed against real hardware
-or a capture. Index 5 is treated as experimental 24mm support, while
-only 6mm, 12mm, and 18mm are fully verified end-to-end.
+Indices 0, 2, 5, 6, and 7 (4mm, 9mm, 24mm, 36mm, 50mm) are extrapolated
+from the lineup pattern and have **not** been confirmed against real
+hardware. The driver maps 2 → 9mm, 5 → 24mm and 6 → 36mm on that basis;
+0 and 7 are rejected.
 
 The meaning of the other 7 bytes in the response (always `08 00 00
 <idx> 00 00 00 00` in every observed sample) is unknown; byte 0 (`08`)
@@ -155,6 +164,43 @@ is constant and does not vary with tape width, and might just be an
 echo of `wLength`. No sample with no tape loaded at all has been
 captured, so it's unknown whether/how that case is distinguished from
 a real width index.
+
+### 1.6 Job submission sequence (SR3900P Windows driver)
+
+A USBPcap capture of the SR3900P Windows driver printing one 9mm
+half-cut label (`capture-kit/usbcap_9mm_half.pcapng`, 2026-11-15)
+shows this sequence on the wire:
+
+| t (s)  | Transfer | Bytes | Notes |
+|-------:|----------|------:|-------|
+| 7.3    | `C1 01` vendor status (IN, 8 B) | `08 00 00 02 00 00 00 00` | tape index 2 (9mm), activity byte 1 = `00` idle |
+| 10.459 | `21 02 0000 0000` **SOFT_RESET** (USB printer class, to interface) | — | issued right before the job |
+| 10.459 | `A1 01` GET_PORT_STATUS (IN, 1 B) | `18` | printer class port status |
+| 10.478 | bulk OUT | 4089 | **starts at the `C` command** — the 2179-byte header block is not sent |
+| 10.491 | bulk OUT | 4092 | raster rows |
+| 10.497 | bulk OUT | 1833 | rest of the job, ending with `0C` + `@` frame |
+| 10.51–18.7 | `C1 01` every ~0.5 s | `08 02 00 02 …` | activity `02` = printing, from immediately after the data |
+| 19.19  | `C1 01` | `08 05 00 02 …` | activity `05`, one sample (cutting?) |
+| 19.70  | `C1 01` | `08 00 00 02 …` | idle again |
+
+Total bulk data: 10014 bytes = the 12193-byte `FILE:` capture of the
+same job minus its 2179-byte header block. No bulk IN reads, no
+zero-length packets, and no other requests occur. The driver also
+interleaves a `C1 01` status read between its ~4 KB bulk chunks.
+
+Consequences for this implementation:
+
+- `send_job` is given [`printer_payload`](../src/tepra/builder.rs) of the
+  job, i.e. everything after the header block. Sending the header too
+  (what every earlier version of this crate did) made an SR3900P wait
+  about 20 seconds before starting to print, and dropping it was
+  confirmed on an SR3900P to make printing start immediately; the
+  SR3700P printed with it, but that may simply have been the same
+  timeout going unnoticed.
+  `--send-header` restores the old behaviour for experiments.
+- `SOFT_RESET` is issued before every job (`--no-soft-reset` to skip).
+- `--wait` polls the status until the activity byte returns to `00`,
+  which is how the Web frontend serialises consecutive jobs.
 
 ## 2. Job byte stream format
 
@@ -209,12 +255,14 @@ leading `ESC {` and the `0x80` length byte):
 | Offset | Field                        | Notes |
 |-------:|-------------------------------|-------|
 | 0–2    | `1B 7B 80`                     | Frame start + fixed length marker |
-| 8      | Tape width in mm               | `0x06`=6mm, `0x0C`=12mm, `0x12`=18mm, `0x18`=experimental 24mm |
+| 8      | Tape width in mm               | `0x06`=6mm, `0x09`=9mm, `0x0C`=12mm, `0x12`=18mm, `0x18`=24mm (experimental), `0x24`=36mm |
+| 9      | Model / driver byte            | `0x0E` in every SR3700P driver capture, `0x68` in every SR3900P driver capture; meaning unknown (`Model::header_byte_9`). |
 | 0x21   | `"SPC10"` (UTF-16LE)            | Unknown purpose; possibly a format/protocol version tag |
-| 0x61   | `"306"` (UTF-16LE)              | Unknown purpose |
+| 0x61   | `"306"` / `"500"` (UTF-16LE)    | Unknown purpose; `"306"` from the SR3700P driver, `"500"` from the SR3900P driver (`Model::header_version_tag`). Looks like a software version. |
+| 32     | Unknown flag                   | `0x01` in every SR3700P capture and in the SR3900P two-copy 9mm capture; `0x00` in the other SR3900P captures (including the two-copy 36mm one). Not tape width, cut mode or copy count. Kept at `0x01`. |
 | 0x81   | `"obj_barcode\t\nprint_form\tGeneral\ncatalog_desc\t"` (ASCII) | Unknown purpose; looks like leftover template/object metadata from the desktop app's internal document model |
 | 20     | Grows by 4 per extra character  | `value = 12 + 4 * char_count`. Confirmed for char_count 1 and 2; likely related to some per-character/per-object table size, but the underlying table itself has not been located. |
-| 23     | Tape-width-dependent byte, unknown meaning | 6mm→3, 12mm→5, 18mm→6, experimental 24mm→7. No formula found relating it to tape width or bitmap size (see also 3.1) — kept as a hardcoded lookup table. |
+| 23     | Tape-width-dependent byte, unknown meaning | 6mm→3, 9mm→4, 12mm→5, 18mm→6, 36mm→8 (captured), 24mm→7 (interpolated). An ordinal into the tape lineup; same on both models (see 3.2). |
 | 2177   | Checksum                       | `sum(bytes[3..2177]) mod 256` |
 | 2178   | `0x7D`                          | Frame end |
 
@@ -227,19 +275,19 @@ Implemented in `src/tepra/header.rs`.
 
 ### 2.3 Configuration commands
 
-Five `ESC { }` command frames follow the header block, always in this
-order:
+Three `ESC { }` command frames follow the header block, then one
+`L`/`T` pair per copy (see 2.6):
 
 | Cmd | Params (hex)         | Meaning |
 |-----|----------------------|---------|
-| `C` | `03 01 01 01`         | Unknown. Constant in every capture. |
+| `C` | 4 bytes               | **Cut mode** (SR3900P captures that differed only in the driver's cut setting): full cut `03 01 01 01`, half cut `02 02 01 01`, no cut `00 00 00 00`. Every SR3700P capture used full cut. Individual byte meanings unknown; the three observed combinations are used verbatim (`CutMode` in `src/tepra/builder.rs`). |
 | `D` | `05`                  | Unknown. Constant in every capture. |
 | `G` | *(none)*              | Unknown. Constant in every capture. |
 | `L` | `<u32 LE>`            | Number of raster rows that follow. |
-| `T` | `<u16 LE>`            | Number of leading blank raster rows (the print content's offset from the start of the raster data — see 3.2). |
+| `T` | `<u16 LE>`            | Number of leading blank raster rows (the print content's offset from the start of the raster data). With the app's default margin setting the SR3900P captures have 48 blank rows (3.4mm) before the first ink and 66 (4.7mm) after the last; `T` is the first inked row, so it is 59 on 4/6mm tape where the top of the "T" is clipped off. |
 
 Example (from a captured 36pt "A" on 18mm tape, 170 total raster
-rows, content starting at row 36):
+rows, content starting at row 36, full cut):
 
 ```
 1B 7B 07 43 03 01 01 01 49 7D   ESC{ len=7 'C' 03 01 01 01 checksum=0x49 }
@@ -254,12 +302,12 @@ Implemented in `src/tepra/builder.rs` (frame ordering/assembly) and
 
 ### 2.4 Raster rows
 
-After the configuration commands, exactly `L` raster rows follow back
-to back, with **no separators and no per-row checksum**:
+After `T`, exactly `L` raster rows follow back to back, with **no
+separators and no per-row checksum**:
 
 ```
-0x1B 0x2E 0x00 0x0D 0x0D 0x01 <width_byte> <bitmap: N bytes>
- ESC  '.'  <-- fixed 4 bytes -->  ^ tape-width dependent
+0x1B 0x2E 0x00 0x0D 0x0D 0x01 <dots: u16 LE> <bitmap: dots/8 bytes>
+ ESC  '.'  <- 4 fixed bytes ->  ^ tape-width dependent
 ```
 
 Each row corresponds to one column of dots along the tape feed
@@ -271,12 +319,18 @@ Y axis maps directly to the bit position within a row (tape width
 direction). This was confirmed by reconstructing readable "A" and "B"
 glyphs pixel-for-pixel from captured jobs.
 
-The 4 constant bytes after `ESC .` (`00 0D 0D 01`) are unknown; they
-have been observed identical in every capture regardless of tape
-width, font size, or content.
+The 4 fixed bytes after `ESC .` are `00 0D 0D 01` in every SR3700P
+driver capture and `00 0A 0A 01` in every SR3900P driver capture
+(`Model::row_prefix`). The middle pair is most likely the dot pitch
+in 1/3600 inch (`3600 / 270 = 13.3 → 0x0D`, `3600 / 360 = 10 → 0x0A`).
 
-`width_byte` and the bitmap length `N` depend on the tape width — see
-section 3.1 for the exact relationship. Bits are packed MSB-first.
+`dots` is the number of head dots used for the tape width on that
+model (section 3.1), as a 16-bit little-endian value, and the bitmap
+is exactly `dots / 8` bytes, packed MSB-first. (Upstream read this
+field as a single byte followed by a `dots + 8`-bit bitmap; both
+readings produce the same bytes for every width below 256 dots. The
+SR3900P 36mm capture — `80 01` followed by 48 bytes — settles it as a
+16-bit field.)
 
 Implemented in `src/tepra/raster.rs`.
 
@@ -297,105 +351,147 @@ After the last raster row:
 Implemented as `TRAILING_BYTE` + `build_command_frame(b'@', &[])` in
 `src/tepra/builder.rs`.
 
+### 2.6 Multiple copies
+
+When the SR3900P driver is asked for two copies of a label it emits
+one job in which the `L`/`T`/raster/`0x0C` block is repeated once per
+copy, with the header and `C`/`D`/`G` sent only once
+(`tests/fixtures/sr3900p-*-x2.prn`):
+
+```
+header, C, D, G, { L, T, rows..., 0x0C } × copies, '@'
+```
+
+The cut mode in `C` applies between copies as well as at the end. This
+is what `--copies` / `JobOptions::copies` produce.
+
 ## 3. Tape width parameters
 
-Three tape widths have been captured and verified byte-for-byte: 6mm,
-12mm, and 18mm. 24mm support is experimental and extrapolated from the
-known raster formula plus a provisional header aux byte.
+Captured and verified byte-for-byte: 6mm, 12mm and 18mm from the SR3700P
+driver (printed on hardware), and every width from 4mm to 36mm from the
+SR3900P driver (9mm and 36mm in every cut mode and with one and two
+copies; 9mm printed on hardware). 4/9/24/36mm on the SR3700P are
+extrapolated.
 
-### 3.1 Raster row width byte and bitmap size
+### 3.1 Raster row dot count and bitmap size
 
-| Tape width | Header byte (offset 8) | Row `width_byte` | Bitmap size |
-|-----------:|:-----------------------:|:-----------------:|:-----------:|
-| 6mm        | `0x06`                  | `0x38` (56)        | 8 bytes (64 bits) |
-| 12mm       | `0x0C`                  | `0x70` (112)       | 15 bytes (120 bits) |
-| 18mm       | `0x12`                  | `0xA8` (168)       | 22 bytes (176 bits) |
-| 24mm       | `0x18`                  | `0xE0` (224)       | 29 bytes (232 bits), experimental |
+| Model   | Tape width | Header byte 8 | Row `dots` (u16 LE) | Bitmap | Source |
+|---------|-----------:|:-------------:|:-------------------:|:------:|--------|
+| SR3700P | 4mm        | `0x04`        | 40  (`28 00`)        | 5 bytes  | extrapolated |
+| SR3700P | 6mm        | `0x06`        | 56  (`38 00`)        | 7 bytes  | captured |
+| SR3700P | 9mm        | `0x09`        | 88  (`58 00`)        | 11 bytes | extrapolated |
+| SR3700P | 12mm       | `0x0C`        | 112 (`70 00`)        | 14 bytes | captured |
+| SR3700P | 18mm       | `0x12`        | 168 (`A8 00`)        | 21 bytes | captured |
+| SR3700P | 24mm       | `0x18`        | 192 (`C0 00`)        | 24 bytes | extrapolated: the whole 192-dot head (upstream's `224` cannot fit on the head) |
+| SR3700P | 36mm       | `0x24`        | 192 (`C0 00`)        | 24 bytes | extrapolated: the whole head |
+| SR3900P | 4mm        | `0x04`        | 48  (`30 00`)        | 6 bytes  | captured |
+| SR3900P | 6mm        | `0x06`        | 72  (`48 00`)        | 9 bytes  | captured |
+| SR3900P | 9mm        | `0x09`        | 112 (`70 00`)        | 14 bytes | captured |
+| SR3900P | 12mm       | `0x0C`        | 144 (`90 00`)        | 18 bytes | captured |
+| SR3900P | 18mm       | `0x12`        | 216 (`D8 00`)        | 27 bytes | captured |
+| SR3900P | 24mm       | `0x18`        | 288 (`20 01`)        | 36 bytes | captured |
+| SR3900P | 36mm       | `0x24`        | 384 (`80 01`)        | 48 bytes | captured: the whole 384-dot head |
 
-These three data points fit two exact formulas:
+On the SR3900P every captured value is `width_mm * 12` rounded up to a
+multiple of 8 and capped at the 384-dot head (9mm: 108 → 112; 36mm:
+432 → 384), i.e. a printable band of 0.847 × the tape width at 360 dpi
+(12mm tape → 10.2mm, 18mm → 15.2mm, 24mm → 20.3mm).
 
-```
-width_byte   = width_mm * 28 / 3
-bitmap_bits  = width_byte + 8
-bitmap_bytes = ceil(bitmap_bits / 8)
-```
+On the SR3700P the three captured values fit `dots = width_mm * 28 / 3`
+(0.878 × the tape width at 270 dpi: 5.3 / 10.5 / 15.8mm); the
+extrapolated rows apply the same formula rounded up to a multiple of 8
+and capped at the 192-dot head.
 
-Note that the bitmap size is **not** simply proportional to
-`width_mm` (that would predict 6mm/12mm/18mm to be in a 1:2:3 ratio,
-but 8/15/22 is not). The `width_byte * 28/3` relationship was only
-discovered after capturing the 12mm sample — with only 6mm and 18mm
-data points, a naive linear fit through the origin looked plausible
-but was wrong.
-
-This formula is verified only for 6/12/18mm. 24mm currently uses the
-same formula experimentally; support for other widths (3.5mm, 9mm,
-36mm, etc., which the printer line is known to support) would need
-additional captures to confirm or refute it.
+Note that 9mm tape on the SR3900P and 12mm tape on the SR3700P both use
+112 dots (different physical widths).
 
 ### 3.2 Header offset 23 ("aux byte")
 
-| Tape width | Value |
-|-----------:|------:|
-| 6mm        | 3     |
-| 12mm       | 5     |
-| 18mm       | 6     |
-| 24mm       | 7 (experimental) |
+| Tape width | Value | Source |
+|-----------:|------:|--------|
+| 4mm        | 18 (`0x12`) | SR3900P capture |
+| 6mm        | 3     | SR3700P + SR3900P captures |
+| 9mm        | 4     | SR3900P capture |
+| 12mm       | 5     | SR3700P + SR3900P captures |
+| 18mm       | 6     | SR3700P + SR3900P captures |
+| 24mm       | 7     | SR3900P capture |
+| 36mm       | 8     | SR3900P capture |
 
-No formula relating this value to `width_mm`, `width_byte`, or the
-bitmap size has been found. It is stored as a hardcoded lookup table
-(`TapeWidth::aux_byte` in `src/tepra/mod.rs`) pending further data
-points. The 24mm value is provisional until confirmed by a captured 24mm
-job.
+6mm..36mm look like an ordinal into KING JIM's tape lineup (3..=8), but
+4mm is 18, so the byte is not simply that. It does not depend on the
+model (6/12/18mm agree between the two drivers). Stored as a lookup
+table (`TapeWidth::aux_byte` in `src/tepra/mod.rs`).
 
-## 4. Font size / point-to-pixel conversion
+## 4. Resolution and font size
 
-The TEPRA desktop app's point sizes (e.g. "36pt") do not map to
-`fontdue`'s `px` (pixels-per-em) parameter 1:1. By rasterizing a
-captured 36pt "A" glyph at various `px` values and comparing the
-resulting bounding box width against the captured bitmap's column
-span (63 dots, matching the feed-direction extent of the glyph), an
-exact match was found at `px = 104`:
+### 4.1 Dot pitch
+
+| Model   | Head          | Dot pitch (both directions) |
+|---------|---------------|-----------------------------|
+| SR3700P | 192 dots      | 270 dpi (0.094mm)           |
+| SR3900P | 384 dots      | 360 dpi (0.0706mm)          |
+
+Feed-direction dots are square: glyphs in the SR3900P captures have
+normal proportions when one raster row is treated as one head dot.
+Every millimetre ↔ rows conversion (`--left-margin-mm`,
+`--max-tape-length-mm`, the Web UI's label length) uses the model's
+dpi (`Model::dpi`, `Tape::mm_to_rows`). Upstream used 208 dpi for these
+conversions (see 4.2), which made SR3700P labels about 23% shorter than
+the requested length; the SR3900P fixtures (384 dots on 36mm tape)
+rule out anything coarser than ~270 dpi.
+
+### 4.2 Point size → pixels
+
+The TEPRA desktop app renders a font size of `pt` points with an em of
 
 ```
-208 = 104 / 36 * 72   (dots per inch, "printer point size" -> px)
-px  = pt * 208 / 72
+em_dots = pt * 1.1 * dpi / 72        (APP_PT_SCALE = 1.1 in src/font/mod.rs)
 ```
 
-This constant (`DOTS_PER_INCH = 208.0` in `src/font/mod.rs`) has only
-been validated against a single glyph/size pairing (36pt "A"); it
-should hold for other sizes assuming the relationship is linear
-(which is the norm for TrueType/OpenType rasterization), but has not
-been independently re-verified at other point sizes.
+i.e. the app's "point" is 1.1 real points. This was measured from the
+half-width character pitch, which is exactly 0.5 em in MS Gothic (the
+app's default font) and independent of glyph shapes:
+
+| Capture | Model / dpi | Text | Half-width pitch | em | dots per pt | factor |
+|---------|-------------|------|-----------------:|---:|------------:|-------:|
+| `tests/fixtures/aa.prn` (upstream) | SR3700P, 270 | 36pt "AA" | 74 rows | 148 | 4.11 | 1.097 |
+| `tests/fixtures/sr3900p-w*.prn` | SR3900P, 360 | MS Gothic 16pt "TEST 123" | 43.8 rows (T→E→S→T 44/43/45, 2→3 43) | 87.6 | 5.47 | 1.095 |
+
+The cap height in the same captures (104 dots at 36pt/270 dpi, 61 dots
+at 16pt/360 dpi) is 0.70 em in both, consistent with MS Gothic.
+
+Upstream's earlier constant (208 "dpi", `px = pt * 208 / 72`) came from
+matching the feed-direction width of BIZ UDPGothic's "A" (a proportional
+glyph ~0.6 em wide) to the 63-dot-wide MS Gothic "A" (~0.43 em) in the
+capture; it made the same nominal point size print about 30% smaller
+than the app does.
 
 ## 5. Open questions
 
 The following aspects of the protocol remain unresolved. They do not
-prevent basic text printing (all currently-known values are either
-constant or have been reduced to a formula/lookup table), but would
-need further captures or hardware experimentation to pin down:
+prevent printing, but would need further captures or hardware
+experimentation to pin down:
 
-- **`C`, `D`, `G` command parameters** (section 2.3): always constant
-  across every capture taken (1–2 plain text characters, two font
-  sizes, three tape widths). Likely control print density, cut
-  behavior, or some other per-job setting that simply wasn't varied in
-  any of the test captures.
+- **`C` command parameters** (section 2.3): only the three observed
+  combinations (full / half / none) are known; what the individual
+  bytes mean is not.
+- **`D`, `G` command parameters**: constant in every capture.
 - **Header block offset 20** (section 2.2): the `12 + 4 * char_count`
-  formula is confirmed for 1 and 2 characters only; unverified for
-  longer strings or non-text objects (e.g. barcodes, given the
-  `obj_barcode` string embedded elsewhere in the header).
-- **Header block offset 23 / "aux byte"** (section 3.2): no formula
-  found from three data points.
+  formula is confirmed for 1 and 2 characters only. The SR3900P
+  captures of `TEST 123` (8 characters) carry `0x20` (= 12 + 4 × 5),
+  so the field counts something other than plain characters (objects?
+  runs?). The SR3700P accepted our value for every text tried so far.
+- **Header block offsets 9, 32 and the version tag** (section 2.2):
+  model/driver dependent; whether the SR3900P firmware requires its
+  driver's values is unknown (we emit them per `--model`).
+- **SR3700P dot counts for 4/9/24/36mm** (section 3.1): extrapolated;
+  no SR3700P driver captures for those widths.
 - **Most of the 2174-byte header payload**: mostly zero-filled and
   treated as an opaque template; likely contains fields relevant to
-  features not yet exercised (e.g. barcodes, multi-line labels,
-  print density/quality settings, cut mode) given the `SPC10`, `306`,
-  and `obj_barcode`/`print_form`/`catalog_desc` strings embedded in it.
+  features not yet exercised (barcodes, print density, …).
 - **The `USBC`/`USBS`-like exchange seen in the Windows USBPcap
   capture** (section 1.4): not required for printing, but its actual
   purpose (if any) on real hardware is unexplained.
-- **Tape widths other than 6/12/18mm**: the formulas in section 3.1
-  are extrapolated from exactly three data points and unverified
-  beyond them.
 
 ## 6. References / raw data
 
@@ -403,6 +499,8 @@ need further captures or hardware experimentation to pin down:
   the Windows driver's output to a `FILE:` port, for various text/tape
   width/font size combinations. Used as golden files in byte-exact
   reconstruction tests.
+- `../capture-kit/usbcap_9mm_half.pcapng` — USBPcap capture of the
+  SR3900P driver printing one 9mm half-cut label (section 1.6).
 - `captures/obtain-tape-width.pcap` — USBPcap capture of the driver
   probing the tape width.
 - `src/tepra/` — the Rust implementation described above.
