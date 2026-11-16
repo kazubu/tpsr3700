@@ -423,70 +423,109 @@ impl FontRenderer {
             .max(1);
         let head_offset = bottom_margin_bits;
 
-        let segments: Vec<String> = match mode {
-            VerticalMode::Stacked => text
-                .chars()
-                .filter(|c| *c != '\n' && *c != '\r')
-                .map(|c| c.to_string())
-                .collect(),
-            VerticalMode::Rotated => text.split('\n').map(|s| s.to_string()).collect(),
-        };
-        if segments.iter().all(|s| s.trim().is_empty()) {
+        // A newline starts a new column in stacked mode and a new line in
+        // rotated mode. Either way the text splits on it first.
+        let lines: Vec<&str> = text.split('\n').map(|l| l.trim_end_matches('\r')).collect();
+        if lines.iter().all(|l| l.trim().is_empty()) {
             anyhow::bail!("nothing to print");
         }
 
+        // Stacked columns sit side by side across the tape, so the width
+        // has to be shared out between them; rotated lines follow one
+        // another along the feed and each gets the whole width.
+        let band = match mode {
+            VerticalMode::Stacked => {
+                let max_columns =
+                    ((tape.width_mm() as f32 / MIN_LINE_HEIGHT_MM).floor() as usize).max(1);
+                if lines.len() > max_columns {
+                    anyhow::bail!(
+                        "too many columns ({}) for {}mm tape (max {max_columns}); \
+                         shorten the text or use wider tape",
+                        lines.len(),
+                        tape.width_mm()
+                    );
+                }
+                head_bits / lines.len()
+            }
+            VerticalMode::Rotated => head_bits,
+        };
+
         let mut columns: Vec<Vec<bool>> = Vec::new();
-        for segment in &segments {
-            let (cols, _advance) = self.rasterize_line(segment, size_px);
-            let width = cols.len();
-            let height = cols.first().map(|c| c.len()).unwrap_or(0);
-            if height == 0 {
-                continue;
-            }
-            if width > head_bits {
-                let what = match mode {
-                    VerticalMode::Stacked => "character",
-                    VerticalMode::Rotated => "line",
-                };
-                anyhow::bail!(
-                    "this {what} needs {width} dots across {}mm tape, which only has {head_bits}; \
-                     use a smaller --size or wider tape",
-                    tape.width_mm()
-                );
-            }
-            // Centre the segment across the tape, then write it with the
-            // axes swapped: the text direction becomes the tape width and
-            // the line height becomes the feed.
-            let lead = (head_bits - width) / 2;
-            let base = columns.len();
-            columns.resize(base + height, vec![false; total_bits]);
-            // In vertical writing a few characters are themselves turned a
-            // quarter turn: the long vowel mark reads as a vertical stroke,
-            // brackets open downwards. Those are placed turned; everything
-            // else keeps the orientation it has in horizontal writing.
-            let turn = mode == VerticalMode::Stacked
-                && segment.chars().count() == 1
-                && segment.chars().next().is_some_and(|c| ROTATED_IN_VERTICAL.contains(&c));
-            let turned_lead = head_bits.saturating_sub(height) / 2;
-            for (x, col) in cols.iter().enumerate() {
-                for (y, &ink) in col.iter().enumerate() {
-                    if !ink {
-                        continue;
-                    }
-                    // Hold the tape with the end that came out first at
-                    // the top: the feed then runs downwards, which is the
-                    // reading direction, and the text direction runs across
-                    // the tape towards the far edge.
-                    let (row, bit) = if turn {
-                        (base + x, head_offset + turned_lead + (height - 1 - y))
-                    } else {
-                        (base + y, head_offset + lead + x)
+        // Where the next rotated line starts along the feed. Stacked
+        // columns each start from the beginning instead.
+        let mut feed_cursor = 0usize;
+        for (index, line) in lines.iter().enumerate() {
+            // The band this line is written into, measured from the far
+            // edge of the tape: in vertical writing the next column sits
+            // to the left of the one before it, which here means lower
+            // bits.
+            let band_lo = match mode {
+                VerticalMode::Stacked => head_bits - (index + 1) * band,
+                VerticalMode::Rotated => 0,
+            };
+            // One character at a time when stacking, the whole line at
+            // once when rotating.
+            let segments: Vec<String> = match mode {
+                VerticalMode::Stacked => line.chars().map(|c| c.to_string()).collect(),
+                VerticalMode::Rotated => vec![line.to_string()],
+            };
+            let mut row_cursor = match mode {
+                VerticalMode::Stacked => 0,
+                VerticalMode::Rotated => feed_cursor,
+            };
+            for segment in &segments {
+                let (cols, _advance) = self.rasterize_line(segment, size_px);
+                let width = cols.len();
+                let height = cols.first().map(|c| c.len()).unwrap_or(0);
+                if height == 0 {
+                    continue;
+                }
+                if width > band {
+                    let what = match mode {
+                        VerticalMode::Stacked => "character",
+                        VerticalMode::Rotated => "line",
                     };
-                    if bit < total_bits && row < columns.len() {
-                        columns[row][bit] = true;
+                    anyhow::bail!(
+                        "this {what} needs {width} dots across {}mm tape, which has {band} \
+                         for it; use a smaller --size, fewer columns, or wider tape",
+                        tape.width_mm()
+                    );
+                }
+                // Centre within the band, then write with the axes
+                // swapped: the text direction becomes the tape width and
+                // the line height becomes the feed.
+                let lead = band_lo + (band - width) / 2;
+                if columns.len() < row_cursor + height {
+                    columns.resize(row_cursor + height, vec![false; total_bits]);
+                }
+                // In vertical writing a few characters are themselves
+                // turned a quarter turn: the long vowel mark reads as a
+                // vertical stroke, brackets open downwards.
+                let turn = mode == VerticalMode::Stacked
+                    && segment.chars().next().is_some_and(|c| ROTATED_IN_VERTICAL.contains(&c));
+                let turned_lead = band_lo + band.saturating_sub(height) / 2;
+                for (x, col) in cols.iter().enumerate() {
+                    for (y, &ink) in col.iter().enumerate() {
+                        if !ink {
+                            continue;
+                        }
+                        // Hold the tape with the end that came out first
+                        // at the top: the feed then runs downwards, which
+                        // is the reading direction, and the text direction
+                        // runs across the tape towards the far edge.
+                        let (row, bit) = if turn {
+                            (row_cursor + x, head_offset + turned_lead + (height - 1 - y))
+                        } else {
+                            (row_cursor + y, head_offset + lead + x)
+                        };
+                        if bit < total_bits && row < columns.len() {
+                            columns[row][bit] = true;
+                        }
                     }
                 }
+                row_cursor += height;
             }
+            feed_cursor = row_cursor.max(feed_cursor);
         }
 
         let rows: Vec<Vec<u8>> = columns
@@ -2728,6 +2767,47 @@ mod tests {
             three.len(),
             one.len()
         );
+    }
+
+    #[test]
+    fn a_newline_starts_a_new_column_when_stacked() {
+        let renderer = default_renderer();
+        let tape = TapeWidth::Mm24.on(Model::Sr3900p);
+        let bits = tape.bitmap_bits();
+        let one = renderer
+            .render_text_vertical("あい", 14.0, tape, 0.0, 0.0, 2, 0, VerticalMode::Stacked)
+            .unwrap()
+            .0;
+        let two = renderer
+            .render_text_vertical("あい\nうえ", 14.0, tape, 0.0, 0.0, 2, 0, VerticalMode::Stacked)
+            .unwrap()
+            .0;
+        // A second column sits beside the first, so the label does not get
+        // longer, but it does use more of the tape width.
+        assert_eq!(
+            two.len(),
+            one.len(),
+            "a second column should not lengthen the label ({} vs {})",
+            two.len(),
+            one.len()
+        );
+        let (_, across_one) = ink_extents(&one, bits);
+        let (_, across_two) = ink_extents(&two, bits);
+        assert!(
+            across_two > across_one,
+            "two columns should span more of the tape ({across_two} vs {across_one})"
+        );
+    }
+
+    #[test]
+    fn more_columns_than_the_tape_allows_is_an_error() {
+        let renderer = default_renderer();
+        let tape = TapeWidth::Mm6.on(Model::Sr3900p);
+        let err = renderer
+            .render_text_vertical("あ\nい\nう", 8.0, tape, 0.0, 0.0, 2, 0, VerticalMode::Stacked)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("too many columns"), "{err}");
     }
 
     #[test]

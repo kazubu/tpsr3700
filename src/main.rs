@@ -917,9 +917,19 @@ fn render_label(
                 // Across the tape a segment is as wide as the text is long,
                 // so the tape width no longer bounds the size the way it
                 // does for ordinary labels; start from the same figure and
-                // let the fit check report anything too big.
-                let size = renderer.max_size_pt_for_tape(tape, top_margin, bottom_margin);
-                eprintln!("no --size given; using {size:.1}pt (largest that fits {}mm tape)", tape.width_mm());
+                // let the fit check report anything too big. Stacked
+                // columns share the width, so divide it between them.
+                let columns = match mode {
+                    VerticalMode::Stacked => text.split('\n').count().max(1),
+                    VerticalMode::Rotated => 1,
+                };
+                let size =
+                    renderer.max_size_pt_for_tape(tape, top_margin, bottom_margin) / columns as f32;
+                if columns > 1 {
+                    eprintln!("no --size given; using {size:.1}pt ({columns} columns on {}mm tape)", tape.width_mm());
+                } else {
+                    eprintln!("no --size given; using {size:.1}pt (largest that fits {}mm tape)", tape.width_mm());
+                }
                 size
             }
         };
