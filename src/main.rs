@@ -3,6 +3,7 @@ use clap::Parser;
 use std::path::PathBuf;
 use tpsr3700::font::{FontRenderer, TextAlign, DEFAULT_FONT_BYTES, DEFAULT_LEFT_MARGIN_MM, DEFAULT_RIGHT_MARGIN_MM};
 use tpsr3700::font::VerticalMode;
+use tpsr3700::usb::JobOutcome;
 use tpsr3700::tepra::builder::{build_print_job_multi, printer_payload, CutMode, JobOptions};
 use tpsr3700::tepra::raster::ROW_HEADER_LEN;
 use tpsr3700::tepra::{DotsSource, Model, Tape, TapeWidth};
@@ -185,6 +186,20 @@ struct Args {
     /// sent; the tape is left uncut wherever it stopped.
     #[arg(long)]
     abort: bool,
+
+    /// Do not send the job a second time when the printer drops the
+    /// first one with a transient fault. Retrying is safe because a
+    /// dropped job prints nothing, but a fault raised part way through a
+    /// label would leave that part on the tape before the retry.
+    #[arg(long)]
+    no_retry: bool,
+
+    /// Do not refuse to print when the printer reports a fault in its
+    /// status. The fault bits are what stop a job from being reported as
+    /// printed when the printer actually dropped it, so skip this only
+    /// to get a job out of a printer whose status looks wrong.
+    #[arg(long)]
+    no_status_check: bool,
 
     /// Do not check the loaded tape against --tape-mm before printing.
     /// The check is what stops a job from being printed onto the wrong
@@ -540,12 +555,16 @@ fn main() -> Result<()> {
         let printer = open_printer(&args)?;
         let st = printer.get_status()?;
         println!(
-            "status {:02x?} activity={:#04x} idle={} tape_index={}",
+            "status {:02x?} activity={:#04x} idle={} tape_index={} fault={}",
             st.raw,
             st.activity(),
             st.is_idle(),
-            st.tape_index()
+            st.tape_index(),
+            st.has_error()
         );
+        if st.has_error() {
+            println!("fault: {}", st.fault_summary());
+        }
         match printer.get_port_status() {
             Ok(ps) => println!("port_status {ps:#04x}"),
             Err(e) => println!("port_status unavailable: {e}"),
@@ -794,61 +813,93 @@ fn main() -> Result<()> {
         let printer = printer
             .as_mut()
             .expect("printer connection opened above when --no-print is not set");
-        // Same sequence as the SR3900P Windows driver (docs/protocol.md
-        // section 1.6): SOFT_RESET, bulk-write the job without the
-        // header block, then poll the status until idle.
-        //
-        // With one addition at the front: wait until the printer is
-        // idle. A job sent while the previous one is still printing or
-        // cutting can be dropped, and the SOFT_RESET that precedes it
-        // would abort that previous job -- either way a label goes
-        // missing while both jobs report success.
-        let t0 = std::time::Instant::now();
-        if args.wait {
-            printer.wait_until_ready(
-                std::time::Duration::from_secs(120),
-                |st| eprintln!("[{:.1}s] waiting for the printer, status {:02x?}", t0.elapsed().as_secs_f32(), st.raw),
-            )?;
-        }
-        match printer.get_port_status() {
-            Ok(ps) => eprintln!("port status {ps:#04x}"),
-            Err(e) => eprintln!("warning: could not read the port status: {e}"),
-        }
-        if !args.no_soft_reset {
-            printer.soft_reset()?;
-        }
         let payload = if args.send_header { &job[..] } else { printer_payload(&job) };
-        // The printer takes the bytes only as fast as it prints them, so
-        // for a multi-label job these are also progress reports. The web
-        // front end parses them to move its progress bar.
-        let mut reported = 0usize;
-        printer.send_job_with_progress(payload, |sent, total| {
-            if sent == total || sent - reported >= 64 * 1024 {
-                reported = sent;
-                eprintln!("progress sent={sent} total={total}");
+        let wait_timeout = std::time::Duration::from_secs(180 + 30 * labels.len() as u64);
+        // The first print after the printer has been sitting idle
+        // sometimes comes back as a fault with nothing printed (see
+        // docs/protocol.md section 1.5). Sending it again has worked
+        // every time, and a dropped job leaves no tape behind, so try
+        // once more rather than making the operator do it.
+        let attempts = if args.no_retry { 1 } else { 2 };
+        for attempt in 1..=attempts {
+            // Same sequence as the SR3900P Windows driver
+            // (docs/protocol.md section 1.6): SOFT_RESET, bulk-write the
+            // job without the header block, then poll the status until
+            // idle.
+            //
+            // With one addition at the front: wait until the printer is
+            // idle. A job sent while the previous one is still printing
+            // or cutting can be dropped, and the SOFT_RESET that
+            // precedes it would abort that previous job -- either way a
+            // label goes missing while both jobs report success.
+            let t0 = std::time::Instant::now();
+            if args.wait {
+                printer.wait_until_ready(
+                    std::time::Duration::from_secs(120),
+                    !args.no_status_check,
+                    |st| eprintln!("[{:.1}s] waiting for the printer, status {:02x?}", t0.elapsed().as_secs_f32(), st.raw),
+                )?;
             }
-        })?;
-        eprintln!(
-            "sent job to printer ({} bytes{}) in {:.2}s",
-            payload.len(),
-            if args.send_header { ", including header" } else { "" },
-            t0.elapsed().as_secs_f32()
-        );
-        if args.wait {
-            let (st, saw_busy) = printer.wait_until_idle(
-                std::time::Duration::from_secs(180 + 30 * labels.len() as u64),
+            match printer.get_port_status() {
+                Ok(ps) => eprintln!("port status {ps:#04x}"),
+                Err(e) => eprintln!("warning: could not read the port status: {e}"),
+            }
+            if !args.no_soft_reset {
+                printer.soft_reset()?;
+            }
+            // The printer takes the bytes only as fast as it prints them
+            // once its buffer is full, so for a long job these are also
+            // progress reports. The web front end parses them to move its
+            // progress bar.
+            let mut reported = 0usize;
+            printer.send_job_with_progress(payload, |sent, total| {
+                if sent == total || sent - reported >= 64 * 1024 {
+                    reported = sent;
+                    eprintln!("progress sent={sent} total={total}");
+                }
+            })?;
+            eprintln!(
+                "sent job to printer ({} bytes{}) in {:.2}s{}",
+                payload.len(),
+                if args.send_header { ", including header" } else { "" },
+                t0.elapsed().as_secs_f32(),
+                if attempt > 1 { format!(" (attempt {attempt})") } else { String::new() }
+            );
+            if !args.wait {
+                break;
+            }
+            let outcome = printer.wait_until_idle(
+                wait_timeout,
                 std::time::Duration::from_secs(10),
+                !args.no_status_check,
                 |st| eprintln!("[{:.1}s] status {:02x?}", t0.elapsed().as_secs_f32(), st.raw),
             )?;
-            if !saw_busy {
-                anyhow::bail!(
+            match outcome {
+                JobOutcome::Printed(st) => {
+                    eprintln!("printer idle after {:.1}s (status {:02x?})", t0.elapsed().as_secs_f32(), st.raw);
+                    break;
+                }
+                JobOutcome::NeverStarted(st) => anyhow::bail!(
                     "the printer never reported itself busy after the job was sent \
-                     (status {:02x?}); it most likely did not accept the job, so nothing \
-                     was printed. Check the printer for an error, then try again.",
+                     (status {:02x?}); it did not take the job, so nothing was printed. \
+                     Check the printer for an error, then try again.",
                     st.raw
-                );
+                ),
+                JobOutcome::Fault(st) => {
+                    let retryable = !st.fault_is_persistent() && attempt < attempts;
+                    if !retryable {
+                        anyhow::bail!(
+                            "the printer reported a fault and dropped the job; nothing, or \
+                             only part of the label, was printed: {}",
+                            st.fault_summary()
+                        );
+                    }
+                    eprintln!(
+                        "warning: the printer dropped the job ({}); sending it again",
+                        st.fault_summary()
+                    );
+                }
             }
-            eprintln!("printer idle after {:.1}s (status {:02x?})", t0.elapsed().as_secs_f32(), st.raw);
         }
     }
 

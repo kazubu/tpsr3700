@@ -160,6 +160,58 @@ to mean 50mm. The other 7 bytes are not fully understood;
 byte 0 is a constant `0x08` and byte 1 is an activity state (`00` idle,
 `02` printing, `05` cutting, observed while printing on hardware).
 
+Bytes 2 and 5 are fault flags. They are zero in every healthy sample
+taken so far -- idle, printing and cutting, on hardware and in the
+Windows driver's capture -- and were set on a job that printed nothing:
+
+```text
+08 02 00 02 00 00 00 00   printing normally (7.2s for this label)
+08 00 06 00 00 00 00 00   no tape cassette (byte 3, the index, is 0 too)
+08 00 21 02 00 80 00 00   cover open (the cassette is still reported)
+08 00 21 00 00 80 00 00   cover open with the cassette taken out
+08 02 20 02 00 10 00 00   the same job dropped, idle again 2.4s later
+```
+
+Byte 2 carries condition bits: `0x01` cover open, `0x06` no cassette.
+The `0x06` pair only appears while the cover is shut: with it open the
+printer stops reporting the missing cassette in byte 2 and only the
+tape index falling to 0 gives it away.
+
+The tape index itself is latched when the cover closes, not sampled
+live. Opening the cover and pulling the cassette out leaves the index
+at the width that was last seen (confirmed on an SR750, 2026-11-17), so
+it only ever goes stale while the cover is open -- and a job cannot be
+printed in that state anyway, because the open cover is reported as a
+fault. By the time a job can print, the index describes the cassette
+that is actually in the machine.
+`0x20` appears in the two states that stopped a job but not when the
+cassette is simply missing, so it marks a fault rather than a
+not-ready condition. Byte 5 then names that fault: `0x80` cover, `0x10`
+whatever dropped the job above. It is `00` with no cassette, which fits
+a field that reports why a job failed rather than the current state.
+
+Note that both the cover-open and the no-cassette samples report
+activity `00` and would pass an idle check, which is why the fault
+bytes are read separately.
+
+A printer reporting either byte non-zero has not printed what it was
+sent, so the driver treats non-zero as a fault and refuses to report
+the job as printed (`--no-status-check` overrides).
+
+The cause behind `byte 5 = 0x10` is still unknown, but its pattern is
+not: every occurrence so far has been the **first** print after the
+printer had been sitting unused, never one in a run of jobs. That rules
+out heat and load, and points at something about coming out of idle.
+The same job sent again goes through. Note that the Windows driver's
+capture has a three second gap between its status read and the
+SOFT_RESET that opens the job, where this driver takes about 0.2s --
+whether that gap is deliberate or just the operator clicking is not
+known.
+
+Because a dropped job prints nothing, the driver sends the job once
+more when it sees a fault that is not one of the two conditions a
+person has to fix (`--no-retry` disables this).
+
 The tape feed operations ("tape feed" / "feed and cut") are plain print
 jobs of blank raster rows, cut per the `C` command; `--feed-mm` sends
 one. A full/half cut also ejects the fixed head-to-cutter lead (~9mm on

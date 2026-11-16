@@ -91,6 +91,18 @@ pub fn find_device_with(vid: u16, pid: u16) -> Result<Device<GlobalContext>> {
     );
 }
 
+/// How a sent job ended, as seen through the printer's status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobOutcome {
+    /// The printer went busy and came back idle: it printed.
+    Printed(PrinterStatus),
+    /// The printer never reported itself busy within the grace period.
+    /// It did not take the job.
+    NeverStarted(PrinterStatus),
+    /// The printer raised a fault instead of finishing the job.
+    Fault(PrinterStatus),
+}
+
 /// An open connection to the printer's bulk endpoints.
 pub struct Printer {
     handle: DeviceHandle<GlobalContext>,
@@ -121,8 +133,75 @@ impl PrinterStatus {
     }
 
     /// Tape width index (byte 3); see `TapeWidth::from_detected_index`.
+    ///
+    /// Latched when the cover closes rather than sampled live: taking
+    /// the cassette out with the cover open leaves the previous width
+    /// here. That only matters while the cover is open, which is itself
+    /// reported as a fault, so a printable state always has an index
+    /// that matches the cassette.
     pub fn tape_index(&self) -> u8 {
         self.raw[3]
+    }
+
+    /// Whether the printer is reporting a fault.
+    ///
+    /// Bytes 2 and 5 are zero in every healthy sample taken so far --
+    /// idle, printing and cutting, on hardware and in the Windows
+    /// driver's own capture. They were set in a job that printed nothing
+    /// and gave up after 2.4s while reporting success to the host
+    /// (`08 02 20 02 00 10 00 00`, 2026-11-17). What each bit means is
+    /// not decoded; what matters is that zero means healthy, so anything
+    /// else is a job that should not be reported as printed.
+    pub fn has_error(&self) -> bool {
+        self.raw[2] != 0 || self.raw[5] != 0
+    }
+
+    /// What the fault bits are known to mean, for the error message.
+    ///
+    /// Samples taken on an SR750 (2026-11-17), with the printer put into
+    /// each state by hand except the last:
+    ///
+    /// ```text
+    /// 08 00 00 02 00 00 00 00   healthy, 9mm tape loaded
+    /// 08 00 06 00 00 00 00 00   no tape cassette (tape index 0 as well)
+    /// 08 00 21 02 00 80 00 00   cover open (the cassette is still seen)
+    /// 08 00 21 00 00 80 00 00   cover open with the cassette out
+    /// 08 02 20 02 00 10 00 00   job dropped mid-print, cause unknown
+    /// ```
+    ///
+    /// So byte 2 is a set of condition bits -- `0x01` cover, `0x06` no
+    /// cassette -- and `0x20` marks the states that stopped a job, while
+    /// byte 5 names that cause: `0x80` cover, `0x10` whatever dropped
+    /// the job above. The missing cassette is reported through `0x06`
+    /// only while the cover is shut; with it open the tape index going
+    /// to 0 is the only sign, which is why that is checked as well.
+    /// None of this is from documentation, so the raw bytes are always
+    /// included.
+    /// Whether a fault needs someone to go to the printer, as opposed to
+    /// one that may clear by itself. Only the two conditions that have
+    /// been reproduced by hand -- an open cover and a missing cassette --
+    /// count as persistent; anything else is treated as worth one more
+    /// try, since the job that produced `0x10` printed nothing and the
+    /// same job went through minutes later.
+    pub fn fault_is_persistent(&self) -> bool {
+        self.raw[2] & 0x01 != 0
+            || self.raw[5] & 0x80 != 0
+            || self.raw[2] & 0x06 != 0
+            || self.tape_index() == 0
+    }
+
+    pub fn fault_summary(&self) -> String {
+        let mut causes: Vec<&str> = Vec::new();
+        if self.raw[2] & 0x01 != 0 || self.raw[5] & 0x80 != 0 {
+            causes.push("the cover is open");
+        }
+        if self.raw[2] & 0x06 != 0 || self.tape_index() == 0 {
+            causes.push("no tape cassette is loaded");
+        }
+        if causes.is_empty() {
+            causes.push("cause not decoded yet");
+        }
+        format!("{}; status {:02x?}", causes.join(", "), self.raw)
     }
 }
 
@@ -303,6 +382,7 @@ impl Printer {
     pub fn wait_until_ready(
         &self,
         timeout: Duration,
+        check_faults: bool,
         mut on_change: impl FnMut(PrinterStatus),
     ) -> Result<PrinterStatus> {
         let start = std::time::Instant::now();
@@ -312,6 +392,13 @@ impl Printer {
             if last != Some(st) {
                 on_change(st);
                 last = Some(st);
+            }
+            if check_faults && st.has_error() {
+                bail!(
+                    "the printer is reporting a fault: {}. Clear it at the printer and try \
+                     again (--no-status-check sends the job anyway)",
+                    st.fault_summary()
+                );
             }
             if st.is_idle() {
                 return Ok(st);
@@ -327,21 +414,23 @@ impl Printer {
         }
     }
 
-    /// Outcome of [`Printer::wait_until_idle`].
-    ///
-    /// `saw_busy` is the part that matters to the caller: if the printer
-    /// never reported itself busy, the job was almost certainly dropped
-    /// (or never started), and reporting success would be a lie.
     ///
     /// Polls every 200ms until the printer first goes busy and every
     /// 500ms after that (the Windows driver polls at 500ms throughout);
     /// the faster initial poll makes a very short job harder to miss.
+    /// Waits for a sent job to finish, and says how it went.
+    ///
+    /// The distinction that matters is between a job that printed and
+    /// one the printer quietly dropped: if the printer never reported
+    /// itself busy, or reported a fault, calling it printed would be a
+    /// lie. See [`JobOutcome`].
     pub fn wait_until_idle(
         &self,
         timeout: Duration,
         grace: Duration,
+        check_faults: bool,
         mut on_change: impl FnMut(PrinterStatus),
-    ) -> Result<(PrinterStatus, bool)> {
+    ) -> Result<JobOutcome> {
         let start = std::time::Instant::now();
         let mut last: Option<PrinterStatus> = None;
         let mut seen_busy = false;
@@ -351,10 +440,15 @@ impl Printer {
                 on_change(st);
                 last = Some(st);
             }
+            if check_faults && st.has_error() {
+                return Ok(JobOutcome::Fault(st));
+            }
             if !st.is_idle() {
                 seen_busy = true;
-            } else if seen_busy || start.elapsed() >= grace {
-                return Ok((st, seen_busy));
+            } else if seen_busy {
+                return Ok(JobOutcome::Printed(st));
+            } else if start.elapsed() >= grace {
+                return Ok(JobOutcome::NeverStarted(st));
             }
             if start.elapsed() >= timeout {
                 bail!("printer still busy after {:?} (status {:02x?})", timeout, st.raw);
