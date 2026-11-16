@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
 use tpsr3700::font::{FontRenderer, TextAlign, DEFAULT_FONT_BYTES, DEFAULT_LEFT_MARGIN_MM, DEFAULT_RIGHT_MARGIN_MM};
+use tpsr3700::font::VerticalMode;
 use tpsr3700::tepra::builder::{build_print_job_multi, printer_payload, CutMode, JobOptions};
 use tpsr3700::tepra::raster::ROW_HEADER_LEN;
 use tpsr3700::tepra::{DotsSource, Model, Tape, TapeWidth};
@@ -166,6 +167,17 @@ struct Args {
     /// to stderr and the exit status is non-zero.
     #[arg(long)]
     detect_tape: bool,
+
+    /// Lay the label out sideways, for tape applied vertically:
+    /// `stacked` is 縦書き proper (one character after another along the
+    /// tape, each turned a quarter turn so it stands upright), and
+    /// `rotated` turns the whole label a quarter turn (a line runs across
+    /// the tape, the next line follows along the feed). The tape width
+    /// limits a character in stacked mode and a whole line in rotated
+    /// mode. Cannot be combined with --line-ratios or
+    /// --max-tape-length-mm.
+    #[arg(long, value_name = "MODE", conflicts_with_all = ["line_ratios", "max_tape_length_mm"])]
+    vertical: Option<VerticalMode>,
 
     /// Stop whatever the printer is doing and exit: issue the USB
     /// printer-class SOFT_RESET, which the printer takes as "drop this
@@ -881,7 +893,30 @@ fn render_label(
     top_margin: usize,
     bottom_margin: usize,
 ) -> Result<(Vec<Vec<u8>>, u32)> {
-    let (rows, margin) = if let Some(ratios) = line_ratios {
+    let (rows, margin) = if let Some(mode) = args.vertical {
+        let size = match args.size {
+            Some(size) => size,
+            None => {
+                // Across the tape a segment is as wide as the text is long,
+                // so the tape width no longer bounds the size the way it
+                // does for ordinary labels; start from the same figure and
+                // let the fit check report anything too big.
+                let size = renderer.max_size_pt_for_tape(tape, top_margin, bottom_margin);
+                eprintln!("no --size given; using {size:.1}pt (largest that fits {}mm tape)", tape.width_mm());
+                size
+            }
+        };
+        renderer.render_text_vertical(
+            text,
+            size,
+            tape,
+            args.left_margin_mm,
+            args.right_margin_mm,
+            top_margin,
+            bottom_margin,
+            mode,
+        )?
+    } else if let Some(ratios) = line_ratios {
         // With ratios, --size (when given) is the largest-ratio line's
         // size, so the existing would_clip warning on it bounds every
         // line.

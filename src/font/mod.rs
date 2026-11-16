@@ -68,6 +68,47 @@ pub enum TextAlign {
     Right,
 }
 
+/// Characters that are turned a quarter turn in vertical Japanese
+/// writing: the long vowel mark, dashes, ellipses and the bracket
+/// family. Everything else keeps its ordinary orientation.
+///
+/// Left out on purpose: small kana, which are also nudged towards one
+/// corner in careful typesetting. At label sizes the nudge is a dot or
+/// two and not worth the special case.
+const ROTATED_IN_VERTICAL: &[char] = &[
+    'ー', '〜', '～', '…', '‥', '―', '—', '–', '‐', '－', '-',
+    '（', '）', '(', ')', '「', '」', '『', '』', '【', '】',
+    '〔', '〕', '〈', '〉', '《', '》', '｛', '｝', '{', '}', '[', ']',
+    '：', ':', '；', ';', '＝', '=',
+];
+
+/// How to lay a label out sideways, for tape that will be applied
+/// vertically (a spine label, a cable run label read from above).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerticalMode {
+    /// 縦書き proper: one character after another along the feed, each
+    /// turned a quarter turn so it stands upright once the tape hangs
+    /// vertically. The label is as long as the text has characters, and
+    /// the tape width limits how big a character can be.
+    Stacked,
+    /// The whole label turned a quarter turn: a line of text runs across
+    /// the tape and the next line follows along the feed. The tape width
+    /// is the limit on line length, which is what makes this different
+    /// from simply sticking an ordinary label on sideways.
+    Rotated,
+}
+
+impl std::str::FromStr for VerticalMode {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "stacked" => Ok(VerticalMode::Stacked),
+            "rotated" => Ok(VerticalMode::Rotated),
+            other => Err(format!("unknown vertical mode '{other}' (use stacked or rotated)")),
+        }
+    }
+}
+
 impl std::str::FromStr for TextAlign {
     type Err = String;
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
@@ -350,6 +391,125 @@ impl FontRenderer {
     /// within the widest line according to `align` (the label is as long
     /// as the widest line, so alignment has no effect on single-line
     /// text).
+    /// Renders text sideways, for tape that will be applied vertically.
+    ///
+    /// Both modes share one placement rule: a segment is rasterised the
+    /// ordinary way, then written into the tape with its axes swapped,
+    /// so the text direction runs across the tape and the line height
+    /// runs along the feed. A segment is one character in
+    /// [`VerticalMode::Stacked`] and one line in [`VerticalMode::Rotated`].
+    ///
+    /// The tape width therefore limits how long a segment can be: a
+    /// character in stacked mode, a whole line in rotated mode. Anything
+    /// longer is an error rather than a silent clip.
+    ///
+    /// Returns the rows and the leading margin in rows, like the other
+    /// `render_text*` methods.
+    pub fn render_text_vertical(
+        &self,
+        text: &str,
+        size_pt: f32,
+        tape: Tape,
+        left_margin_mm: f32,
+        right_margin_mm: f32,
+        top_margin_bits: usize,
+        bottom_margin_bits: usize,
+        mode: VerticalMode,
+    ) -> Result<(Vec<Vec<u8>>, u32)> {
+        let size_px = pt_to_px(size_pt, tape.model);
+        let total_bits = tape.bitmap_bits();
+        let head_bits = total_bits
+            .saturating_sub(top_margin_bits + bottom_margin_bits)
+            .max(1);
+        let head_offset = bottom_margin_bits;
+
+        let segments: Vec<String> = match mode {
+            VerticalMode::Stacked => text
+                .chars()
+                .filter(|c| *c != '\n' && *c != '\r')
+                .map(|c| c.to_string())
+                .collect(),
+            VerticalMode::Rotated => text.split('\n').map(|s| s.to_string()).collect(),
+        };
+        if segments.iter().all(|s| s.trim().is_empty()) {
+            anyhow::bail!("nothing to print");
+        }
+
+        let mut columns: Vec<Vec<bool>> = Vec::new();
+        for segment in &segments {
+            let (cols, _advance) = self.rasterize_line(segment, size_px);
+            let width = cols.len();
+            let height = cols.first().map(|c| c.len()).unwrap_or(0);
+            if height == 0 {
+                continue;
+            }
+            if width > head_bits {
+                let what = match mode {
+                    VerticalMode::Stacked => "character",
+                    VerticalMode::Rotated => "line",
+                };
+                anyhow::bail!(
+                    "this {what} needs {width} dots across {}mm tape, which only has {head_bits}; \
+                     use a smaller --size or wider tape",
+                    tape.width_mm()
+                );
+            }
+            // Centre the segment across the tape, then write it with the
+            // axes swapped: the text direction becomes the tape width and
+            // the line height becomes the feed.
+            let lead = (head_bits - width) / 2;
+            let base = columns.len();
+            columns.resize(base + height, vec![false; total_bits]);
+            // In vertical writing a few characters are themselves turned a
+            // quarter turn: the long vowel mark reads as a vertical stroke,
+            // brackets open downwards. Those are placed turned; everything
+            // else keeps the orientation it has in horizontal writing.
+            let turn = mode == VerticalMode::Stacked
+                && segment.chars().count() == 1
+                && segment.chars().next().is_some_and(|c| ROTATED_IN_VERTICAL.contains(&c));
+            let turned_lead = head_bits.saturating_sub(height) / 2;
+            for (x, col) in cols.iter().enumerate() {
+                for (y, &ink) in col.iter().enumerate() {
+                    if !ink {
+                        continue;
+                    }
+                    // Hold the tape with the end that came out first at
+                    // the top: the feed then runs downwards, which is the
+                    // reading direction, and the text direction runs across
+                    // the tape towards the far edge.
+                    let (row, bit) = if turn {
+                        (base + x, head_offset + turned_lead + (height - 1 - y))
+                    } else {
+                        (base + y, head_offset + lead + x)
+                    };
+                    if bit < total_bits && row < columns.len() {
+                        columns[row][bit] = true;
+                    }
+                }
+            }
+        }
+
+        let rows: Vec<Vec<u8>> = columns
+            .iter()
+            .map(|col| pack_bits(col, tape.bitmap_bytes()))
+            .collect();
+        let first = rows.iter().position(|r| r.iter().any(|&b| b != 0));
+        let last = rows.iter().rposition(|r| r.iter().any(|&b| b != 0));
+        let trimmed = match (first, last) {
+            (Some(first), Some(last)) => rows[first..=last].to_vec(),
+            _ => anyhow::bail!("nothing to print"),
+        };
+        let left_rows = tape.mm_to_rows(left_margin_mm);
+        let right_rows = tape.mm_to_rows(right_margin_mm);
+        let blank = vec![0u8; tape.bitmap_bytes()];
+        let mut padded =
+            Vec::with_capacity(trimmed.len() + left_rows as usize + right_rows as usize);
+        padded.extend(std::iter::repeat(blank.clone()).take(left_rows as usize));
+        padded.extend(trimmed);
+        padded.extend(std::iter::repeat(blank).take(right_rows as usize));
+        Ok((padded, left_rows))
+    }
+
     pub fn render_text_aligned(
         &self,
         text: &str,
@@ -2526,6 +2686,88 @@ mod tests {
         // The narrower IP line no longer drags the label length.
         assert!(rows_73.len() < rows_eq.len(),
             "7:3 label ({} rows) should be shorter than 1:1 ({} rows)", rows_73.len(), rows_eq.len());
+    }
+
+    // Ink extents of a rendered label: (feed rows, bits across the tape).
+    fn ink_extents(rows: &[Vec<u8>], total_bits: usize) -> (usize, usize) {
+        let mut first_row = None;
+        let mut last_row = 0;
+        let mut min_bit = usize::MAX;
+        let mut max_bit = 0;
+        for (r, row) in rows.iter().enumerate() {
+            for bit in 0..total_bits {
+                if row_bit_is_set(row, bit) {
+                    first_row.get_or_insert(r);
+                    last_row = r;
+                    min_bit = min_bit.min(bit);
+                    max_bit = max_bit.max(bit);
+                }
+            }
+        }
+        match first_row {
+            Some(first) => (last_row - first + 1, max_bit - min_bit + 1),
+            None => (0, 0),
+        }
+    }
+
+    #[test]
+    fn stacked_vertical_grows_with_the_number_of_characters() {
+        let renderer = default_renderer();
+        let tape = TapeWidth::Mm24.on(Model::Sr3900p);
+        let one = renderer
+            .render_text_vertical("あ", 20.0, tape, 0.0, 0.0, 2, 0, VerticalMode::Stacked)
+            .unwrap()
+            .0;
+        let three = renderer
+            .render_text_vertical("あいう", 20.0, tape, 0.0, 0.0, 2, 0, VerticalMode::Stacked)
+            .unwrap()
+            .0;
+        assert!(
+            three.len() > one.len() * 2,
+            "three characters ({} rows) should be about three times one ({} rows)",
+            three.len(),
+            one.len()
+        );
+    }
+
+    #[test]
+    fn a_character_too_wide_for_the_tape_is_an_error() {
+        let renderer = default_renderer();
+        let tape = TapeWidth::Mm6.on(Model::Sr3900p);
+        let err = renderer
+            .render_text_vertical("あ", 40.0, tape, 0.0, 0.0, 2, 0, VerticalMode::Stacked)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("character"), "{err}");
+        assert!(err.contains("6mm tape"), "{err}");
+    }
+
+    #[test]
+    fn a_line_too_long_for_the_tape_is_an_error_when_rotated() {
+        let renderer = default_renderer();
+        let tape = TapeWidth::Mm12.on(Model::Sr3900p);
+        let err = renderer
+            .render_text_vertical("これは長すぎる行です", 20.0, tape, 0.0, 0.0, 2, 0, VerticalMode::Rotated)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("line"), "{err}");
+    }
+
+    #[test]
+    fn the_long_vowel_mark_is_turned_in_stacked_mode() {
+        let renderer = default_renderer();
+        let tape = TapeWidth::Mm24.on(Model::Sr3900p);
+        let bits = tape.bitmap_bits();
+        let (rows, _) = renderer
+            .render_text_vertical("ー", 20.0, tape, 0.0, 0.0, 2, 0, VerticalMode::Stacked)
+            .unwrap();
+        let (feed, across) = ink_extents(&rows, bits);
+        // Turned, the mark is a stroke running along the feed: long in the
+        // reading direction, thin across the tape.
+        assert!(
+            feed > across * 2,
+            "long vowel mark should read as a vertical stroke (feed {feed}, across {across})"
+        );
     }
 
     #[test]
