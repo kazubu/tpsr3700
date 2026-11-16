@@ -167,6 +167,13 @@ struct Args {
     #[arg(long)]
     detect_tape: bool,
 
+    /// Do not check the loaded tape against --tape-mm before printing.
+    /// The check is what stops a job from being printed onto the wrong
+    /// tape; skip it only when the printer reports a width this driver
+    /// cannot read.
+    #[arg(long)]
+    no_tape_check: bool,
+
     /// Print the printer's current state and exit, without printing:
     /// the raw 8-byte vendor status (activity byte and tape index) and
     /// the USB printer-class port status byte. Diagnostic only.
@@ -387,6 +394,40 @@ fn json_string(s: &str) -> String {
 /// `--detect-tape` output with the printer identification: the USB
 /// device ID string and the driver model looked up from the model name
 /// in it (null when unknown).
+/// Compares the tape the printer reports with the width the job is laid
+/// out for.
+///
+/// `Err` means do not print: the wrong tape is loaded, or none is.
+/// `Ok(Some(..))` is a warning to show and carry on with, used when the
+/// printer reports an index this driver cannot map to a width. `want` is
+/// the width from `--tape-mm`.
+fn check_loaded_tape(loaded: Option<TapeWidth>, index: u8, want: TapeWidth) -> Result<Option<String>> {
+    if index == 0 {
+        anyhow::bail!(
+            "no tape is loaded in the printer, but --tape-mm {}mm was given; \
+             load the tape and try again",
+            want.width_mm()
+        );
+    }
+    match loaded {
+        Some(loaded) if loaded != want => anyhow::bail!(
+            "the printer has {}mm tape loaded, but this job is laid out for {}mm; \
+             load {}mm tape, or print with --tape-mm {} (pass --no-tape-check to \
+             print anyway)",
+            loaded.width_mm(),
+            want.width_mm(),
+            want.width_mm(),
+            loaded.width_mm()
+        ),
+        Some(_) => Ok(None),
+        None => Ok(Some(format!(
+            "the printer reports tape width index {index}, which this driver does not know, \
+             so --tape-mm {}mm could not be checked",
+            want.width_mm()
+        ))),
+    }
+}
+
 fn detect_json(detected: Option<TapeWidth>, index: u8, device_id: Option<&str>) -> String {
     let supported = detected.is_some();
     let tape_mm = detected
@@ -557,6 +598,26 @@ fn main() -> Result<()> {
             }
         }
     };
+
+    // An explicit --tape-mm is a promise about what is in the printer, and
+    // nothing checked it: a job for the wrong width prints anyway and the
+    // tape is wasted. Compare it with what the printer reports, whenever
+    // the printer is open (previews and --no-print never open it).
+    //
+    // Blind spot: cable-marking tape reports the same index as plain tape
+    // of the same width, so mixing those two up is not detectable here.
+    if args.tape_mm.is_some() && !args.no_tape_check {
+        if let Some(printer) = printer.as_ref() {
+            match printer.get_tape_width_with_index() {
+                Ok((loaded, index)) => {
+                    if let Some(warning) = check_loaded_tape(loaded, index, width)? {
+                        eprintln!("warning: {warning}");
+                    }
+                }
+                Err(e) => eprintln!("warning: could not check the loaded tape: {e}"),
+            }
+        }
+    }
 
     let tape = width.on(model);
     if tape.dots_source() == DotsSource::Extrapolated {
@@ -911,7 +972,7 @@ fn render_label(
 
 #[cfg(test)]
 mod tests {
-    use super::{detect_json, detect_tape_json, nominal_mm_for_detected_index, parse_line_ratios};
+    use super::{check_loaded_tape, detect_json, detect_tape_json, nominal_mm_for_detected_index, parse_line_ratios};
     use tpsr3700::tepra::TapeWidth;
 
     #[test]
@@ -928,6 +989,30 @@ mod tests {
         assert_eq!(nominal_mm_for_detected_index(0), None);
         assert_eq!(nominal_mm_for_detected_index(7), None);
         assert_eq!(nominal_mm_for_detected_index(255), None);
+    }
+
+    #[test]
+    fn loaded_tape_matching_the_job_is_accepted() {
+        assert!(check_loaded_tape(Some(TapeWidth::Mm9), 2, TapeWidth::Mm9).unwrap().is_none());
+    }
+
+    #[test]
+    fn loaded_tape_of_another_width_is_refused() {
+        let err = check_loaded_tape(Some(TapeWidth::Mm9), 2, TapeWidth::Mm12).unwrap_err().to_string();
+        assert!(err.contains("9mm tape loaded"), "{err}");
+        assert!(err.contains("laid out for 12mm"), "{err}");
+    }
+
+    #[test]
+    fn no_tape_loaded_is_refused() {
+        let err = check_loaded_tape(None, 0, TapeWidth::Mm9).unwrap_err().to_string();
+        assert!(err.contains("no tape is loaded"), "{err}");
+    }
+
+    #[test]
+    fn unknown_tape_index_only_warns() {
+        let warning = check_loaded_tape(None, 7, TapeWidth::Mm9).unwrap();
+        assert!(warning.unwrap().contains("index 7"));
     }
 
     #[test]
