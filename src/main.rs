@@ -167,6 +167,13 @@ struct Args {
     #[arg(long)]
     detect_tape: bool,
 
+    /// Stop whatever the printer is doing and exit: issue the USB
+    /// printer-class SOFT_RESET, which the printer takes as "drop this
+    /// job". Used to cancel a long multi-label job that has already been
+    /// sent; the tape is left uncut wherever it stopped.
+    #[arg(long)]
+    abort: bool,
+
     /// Do not check the loaded tape against --tape-mm before printing.
     /// The check is what stops a job from being printed onto the wrong
     /// tape; skip it only when the printer reports a width this driver
@@ -485,6 +492,15 @@ fn main() -> Result<()> {
         let (detected, index) = printer.get_tape_width_with_index()?;
         let device_id = printer.get_device_id().ok();
         println!("{}", detect_json(detected, index, device_id.as_deref()));
+        return Ok(());
+    }
+
+    // --abort: tell the printer to drop the job it is working on.
+    if args.abort {
+        let printer = open_printer(&args)?;
+        printer.soft_reset()?;
+        let st = printer.get_status()?;
+        println!("abort sent; status {:02x?} idle={}", st.raw, st.is_idle());
         return Ok(());
     }
 

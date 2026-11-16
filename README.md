@@ -83,6 +83,7 @@ tpsr3700 [OPTIONS] <TEXT>
 | `--preview-out <PATH>` | — | Write an SVG preview of the job to this path and exit without printing or prompting. Rendered from the raster rows that would be sent. For web front ends. |
 | `--detect-tape` | — | Query the loaded tape width, print one line of JSON on stdout, and exit: `{"tape_mm": 18, "index": 4, "supported": true, "device_id": "...", "model": "sr3900p"}`. |
 | `--printer-status` | — | Print the printer's current state and exit, without printing: the raw 8-byte vendor status (activity byte and tape index) and the printer-class port status byte. Diagnostic only. |
+| `--abort` | — | Tell the printer to drop the job it is working on (printer-class SOFT_RESET) and exit. Used to cancel a long multi-label job that is already on its way; the tape is left uncut where it stopped. |
 | `--no-tape-check` | off | Print even when the loaded tape is not the width given by `--tape-mm`. By default a mismatch, or no tape at all, is refused before the job is sent. Cable-marking tape reports the same width as plain tape, so that pair is not distinguished. |
 | `--line-ratios <R,R>` | — | Per-line font size ratios for multi-line text (e.g. `7,3`). The count must equal the number of lines. See [Multi-line rules](#multi-line-rules). |
 | `--frame` | off | Draw a rectangular frame around the printed content, hugging the ink with ~1mm of padding. Composes with multi-line text, `--line-ratios`, `--align` and wrapping, and appears in previews. |
@@ -291,6 +292,7 @@ tpsr3700 [オプション] <テキスト>
 | `--preview-out <PATH>` | — | ジョブの SVG プレビューを指定パスに書き出して終了する（印刷も確認プロンプトもしない）。実際に送るラスタ行から描画する。Web フロントエンド用。 |
 | `--detect-tape` | — | 装着テープ幅を問い合わせ、JSON 1 行を標準出力に出して終了する: `{"tape_mm": 18, "index": 4, "supported": true, "device_id": "...", "model": "sr3900p"}`。 |
 | `--printer-status` | — | 印刷せずにプリンタの現在の状態を出して終了する。8 バイトの生ステータス（動作状態バイトとテープインデックス）と、プリンタクラスのポート状態バイト。診断用。 |
+| `--abort` | — | 実行中のジョブを捨てるようプリンタに指示して終了する（プリンタクラスの SOFT_RESET）。送信済みの長いジョブを止める用途。止まった位置でテープは切れずに残る。 |
 | `--no-tape-check` | 無効 | `--tape-mm` と装着テープが違っても印刷する。既定では、幅が違う場合とテープが入っていない場合を、ジョブを送る前にエラーにする。ケーブル表示テープは同じ幅の通常テープと同じ値を返すため、その組み合わせは判別できない。 |
 | `--line-ratios <R,R>` | — | 複数行テキストの行ごとの文字サイズ比率（例: `7,3`）。個数は行数と一致する必要がある。[複数行印刷のルール](#複数行印刷のルール)を参照。 |
 | `--frame` | 無効 | 印字内容の周囲に枠線を描く（インクの外周に約 1mm の余白を取る）。複数行・`--line-ratios`・`--align`・折り返しと併用でき、プレビューにも出る。 |
