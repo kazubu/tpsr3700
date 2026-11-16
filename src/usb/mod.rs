@@ -418,6 +418,39 @@ impl Printer {
     /// Polls every 200ms until the printer first goes busy and every
     /// 500ms after that (the Windows driver polls at 500ms throughout);
     /// the faster initial poll makes a very short job harder to miss.
+    /// Waits for a fault to clear by itself.
+    ///
+    /// The transient fault that drops a job holds the activity byte at
+    /// `02` for a second or two with the fault bits set, then goes back
+    /// to a clean idle. A retry sent before that clears is refused by
+    /// the printer, so wait it out first.
+    pub fn wait_until_fault_clears(
+        &self,
+        timeout: Duration,
+        mut on_change: impl FnMut(PrinterStatus),
+    ) -> Result<PrinterStatus> {
+        let start = std::time::Instant::now();
+        let mut last: Option<PrinterStatus> = None;
+        loop {
+            let st = self.get_status()?;
+            if last != Some(st) {
+                on_change(st);
+                last = Some(st);
+            }
+            if !st.has_error() && st.is_idle() {
+                return Ok(st);
+            }
+            if start.elapsed() >= timeout {
+                bail!(
+                    "the printer is still reporting a fault {:?} after it dropped a job: {}",
+                    timeout,
+                    st.fault_summary()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+
     /// Waits for a sent job to finish, and says how it went.
     ///
     /// The distinction that matters is between a job that printed and

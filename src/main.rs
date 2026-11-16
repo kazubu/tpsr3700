@@ -944,9 +944,17 @@ fn main() -> Result<()> {
                         );
                     }
                     eprintln!(
-                        "warning: the printer dropped the job ({}); sending it again",
+                        "warning: the printer dropped the job ({}); waiting for that to clear \
+                         and sending it again",
                         st.fault_summary()
                     );
+                    // The fault holds for a second or two before the
+                    // printer goes back to idle; a job sent into it is
+                    // refused outright.
+                    printer.wait_until_fault_clears(
+                        std::time::Duration::from_secs(30),
+                        |st| eprintln!("[{:.1}s] status {:02x?}", t0.elapsed().as_secs_f32(), st.raw),
+                    )?;
                 }
             }
         }

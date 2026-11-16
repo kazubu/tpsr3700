@@ -208,9 +208,14 @@ SOFT_RESET that opens the job, where this driver takes about 0.2s --
 whether that gap is deliberate or just the operator clicking is not
 known.
 
-Because a dropped job prints nothing, the driver sends the job once
-more when it sees a fault that is not one of the two conditions a
-person has to fix (`--no-retry` disables this).
+Watched live (2026-11-17), the fault holds the activity byte at `02`
+with the fault bits set for a second or two -- the printer behaves as
+though it had started -- and then goes back to a clean idle by itself.
+A job sent during that window is refused outright.
+
+Because a dropped job prints nothing, the driver waits for the fault to
+clear and then sends the job once more, unless it is one of the two
+conditions a person has to fix (`--no-retry` disables this).
 
 The tape feed operations ("tape feed" / "feed and cut") are plain print
 jobs of blank raster rows, cut per the `C` command; `--feed-mm` sends
