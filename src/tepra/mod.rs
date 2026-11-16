@@ -189,7 +189,36 @@ impl TapeWidth {
         }
     }
 
-    /// Default non-printing margin at each edge of the bitmap, in dots,
+    /// How many dots to keep clear of ink at the low end (dot 0) and at
+    /// the high end of the head band, because they may not reach the
+    /// tape.
+    ///
+    /// Measured twice with `--test-pattern` on an SR750 with 9mm tape
+    /// (2026-11-17): it inks dots 0..107 of its 112, losing four at the
+    /// high end and none at the low one.
+    ///
+    /// The pattern also showed why. Its centre line landed 5.0mm from
+    /// the dot 0 edge of a 9mm tape, so the 112-dot band (7.90mm) runs
+    /// from 1.05mm to 8.95mm and sits about half a millimetre towards
+    /// the high end: that end is level with the edge of the tape, where
+    /// ink does not take, while the low end still has a millimetre of
+    /// tape to spare. The official driver sends the same 112 dots and
+    /// loses them too; its text never reaches that far.
+    ///
+    /// That makes this a property of how one machine holds the tape, not
+    /// of the model, and the four dots are a fit at one width rather
+    /// than a rule: a narrower tape has less margin to absorb the same
+    /// physical offset. `--test-pattern` measures a particular printer
+    /// and `--ignore-print-band` with `--top-margin` / `--bottom-margin`
+    /// overrides these.
+    ///
+    /// Only sideways text runs into this: it is as wide across the tape
+    /// as the text is long, where ordinary labels are kept clear of the
+    /// ends by the font metrics.
+    pub const EDGE_CLEARANCE_LOW_DOTS: usize = 0;
+    pub const EDGE_CLEARANCE_HIGH_DOTS: usize = 4;
+
+    /// Default non-printing margin at each edge of the bitmap, in dots,    /// Default non-printing margin at each edge of the bitmap, in dots,    /// Default non-printing margin at each edge of the bitmap, in dots,
     /// for library callers that don't pick their own. The CLI uses its
     /// own (smaller) defaults; see `--top-margin` / `--bottom-margin`.
     pub const HEAD_MARGIN_BITS: usize = 8;

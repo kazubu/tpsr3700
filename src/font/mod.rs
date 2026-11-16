@@ -7,9 +7,7 @@
 //! the usual way and mapping (x, y) -> (row, bit) produces correctly
 //! oriented output, confirmed against captured "A"/"B" print jobs.
 
-use crate::tepra::{Model, Tape};
-#[cfg(test)]
-use crate::tepra::TapeWidth;
+use crate::tepra::{Model, Tape, TapeWidth};
 use anyhow::{Context, Result};
 
 /// BIZ UDPゴシック Regular — bundled directly in the binary so no system
@@ -415,13 +413,27 @@ impl FontRenderer {
         top_margin_bits: usize,
         bottom_margin_bits: usize,
         mode: VerticalMode,
+        keep_edge_clearance: bool,
     ) -> Result<(Vec<Vec<u8>>, u32)> {
         let size_px = pt_to_px(size_pt, tape.model);
         let total_bits = tape.bitmap_bits();
-        let head_bits = total_bits
-            .saturating_sub(top_margin_bits + bottom_margin_bits)
-            .max(1);
-        let head_offset = bottom_margin_bits;
+        // Sideways text is as wide across the tape as the text is long,
+        // so unlike an ordinary label it runs straight into the ends of
+        // the head band -- which may not reach the tape at all. Keep a
+        // measured clearance there, so a line that would lose its last
+        // stroke is refused instead of printed short.
+        let (clear_lo, clear_hi) = if keep_edge_clearance {
+            (
+                TapeWidth::EDGE_CLEARANCE_LOW_DOTS,
+                TapeWidth::EDGE_CLEARANCE_HIGH_DOTS,
+            )
+        } else {
+            (0, 0)
+        };
+        let head_lo = bottom_margin_bits.max(clear_lo);
+        let head_hi = total_bits.saturating_sub(top_margin_bits.max(clear_hi));
+        let head_bits = head_hi.saturating_sub(head_lo).max(1);
+        let head_offset = head_lo;
 
         // A newline starts a new column in stacked mode and a new line in
         // rotated mode. Either way the text splits on it first.
@@ -2754,11 +2766,11 @@ mod tests {
         let renderer = default_renderer();
         let tape = TapeWidth::Mm24.on(Model::Sr3900p);
         let one = renderer
-            .render_text_vertical("あ", 20.0, tape, 0.0, 0.0, 2, 0, VerticalMode::Stacked)
+            .render_text_vertical("あ", 20.0, tape, 0.0, 0.0, 2, 0, VerticalMode::Stacked, true)
             .unwrap()
             .0;
         let three = renderer
-            .render_text_vertical("あいう", 20.0, tape, 0.0, 0.0, 2, 0, VerticalMode::Stacked)
+            .render_text_vertical("あいう", 20.0, tape, 0.0, 0.0, 2, 0, VerticalMode::Stacked, true)
             .unwrap()
             .0;
         assert!(
@@ -2775,11 +2787,11 @@ mod tests {
         let tape = TapeWidth::Mm24.on(Model::Sr3900p);
         let bits = tape.bitmap_bits();
         let one = renderer
-            .render_text_vertical("あい", 14.0, tape, 0.0, 0.0, 2, 0, VerticalMode::Stacked)
+            .render_text_vertical("あい", 14.0, tape, 0.0, 0.0, 2, 0, VerticalMode::Stacked, true)
             .unwrap()
             .0;
         let two = renderer
-            .render_text_vertical("あい\nうえ", 14.0, tape, 0.0, 0.0, 2, 0, VerticalMode::Stacked)
+            .render_text_vertical("あい\nうえ", 14.0, tape, 0.0, 0.0, 2, 0, VerticalMode::Stacked, true)
             .unwrap()
             .0;
         // A second column sits beside the first, so the label does not get
@@ -2804,7 +2816,7 @@ mod tests {
         let renderer = default_renderer();
         let tape = TapeWidth::Mm6.on(Model::Sr3900p);
         let err = renderer
-            .render_text_vertical("あ\nい\nう", 8.0, tape, 0.0, 0.0, 2, 0, VerticalMode::Stacked)
+            .render_text_vertical("あ\nい\nう", 8.0, tape, 0.0, 0.0, 2, 0, VerticalMode::Stacked, true)
             .unwrap_err()
             .to_string();
         assert!(err.contains("too many columns"), "{err}");
@@ -2815,7 +2827,7 @@ mod tests {
         let renderer = default_renderer();
         let tape = TapeWidth::Mm6.on(Model::Sr3900p);
         let err = renderer
-            .render_text_vertical("あ", 40.0, tape, 0.0, 0.0, 2, 0, VerticalMode::Stacked)
+            .render_text_vertical("あ", 40.0, tape, 0.0, 0.0, 2, 0, VerticalMode::Stacked, true)
             .unwrap_err()
             .to_string();
         assert!(err.contains("character"), "{err}");
@@ -2827,7 +2839,7 @@ mod tests {
         let renderer = default_renderer();
         let tape = TapeWidth::Mm12.on(Model::Sr3900p);
         let err = renderer
-            .render_text_vertical("これは長すぎる行です", 20.0, tape, 0.0, 0.0, 2, 0, VerticalMode::Rotated)
+            .render_text_vertical("これは長すぎる行です", 20.0, tape, 0.0, 0.0, 2, 0, VerticalMode::Rotated, true)
             .unwrap_err()
             .to_string();
         assert!(err.contains("line"), "{err}");
@@ -2839,7 +2851,7 @@ mod tests {
         let tape = TapeWidth::Mm24.on(Model::Sr3900p);
         let bits = tape.bitmap_bits();
         let (rows, _) = renderer
-            .render_text_vertical("ー", 20.0, tape, 0.0, 0.0, 2, 0, VerticalMode::Stacked)
+            .render_text_vertical("ー", 20.0, tape, 0.0, 0.0, 2, 0, VerticalMode::Stacked, true)
             .unwrap();
         let (feed, across) = ink_extents(&rows, bits);
         // Turned, the mark is a stroke running along the feed: long in the

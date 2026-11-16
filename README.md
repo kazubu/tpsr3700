@@ -83,6 +83,8 @@ tpsr3700 [OPTIONS] <TEXT>
 | `--wait` | off | Wait for the printer around the job: block until it is idle before sending, then poll the status until it is idle again. Fails if the printer never reported itself busy, which means it did not take the job. Status changes go to stderr. |
 | `--preview-out <PATH>` | — | Write an SVG preview of the job to this path and exit without printing or prompting. Rendered from the raster rows that would be sent. For web front ends. |
 | `--detect-tape` | — | Query the loaded tape width, print one line of JSON on stdout, and exit: `{"tape_mm": 18, "index": 4, "supported": true, "device_id": "...", "model": "sr3900p"}`. |
+| `--test-pattern` | — | Print a ruler instead of text to measure how much of the head band reaches the tape: two lines at the clearance sideways text keeps, with one countable dash per dot outside each. See `docs/protocol.md` §1.5.1. |
+| `--ignore-print-band` | off | Lay sideways text out across the whole head band, without the clearance normally kept at each end for dots that may not reach the tape. Use with `--top-margin` / `--bottom-margin` after measuring with `--test-pattern`. |
 | `--printer-status` | — | Print the printer's current state and exit, without printing: the raw 8-byte vendor status (activity byte and tape index) and the printer-class port status byte. Diagnostic only. |
 | `--abort` | — | Tell the printer to drop the job it is working on (printer-class SOFT_RESET) and exit. Used to cancel a long multi-label job that is already on its way; the tape is left uncut where it stopped. |
 | `--no-retry` | off | Do not send the job again when the printer drops it with a transient fault. The retry is safe because a dropped job prints nothing, but a fault raised part way through a label would leave that part on the tape. |
@@ -295,6 +297,8 @@ tpsr3700 [オプション] <テキスト>
 | `--wait` | 無効 | ジョブの前後でプリンタを待つ。送信前は idle になるまで待ち（印刷中やカット中に送るとジョブが捨てられるため）、送信後は idle に戻るまで状態を見る。プリンタが一度も動作中にならなかった場合は、ジョブを受け取っていないとみなしてエラーにする。状態の変化は標準エラー出力に出る。 |
 | `--preview-out <PATH>` | — | ジョブの SVG プレビューを指定パスに書き出して終了する（印刷も確認プロンプトもしない）。実際に送るラスタ行から描画する。Web フロントエンド用。 |
 | `--detect-tape` | — | 装着テープ幅を問い合わせ、JSON 1 行を標準出力に出して終了する: `{"tape_mm": 18, "index": 4, "supported": true, "device_id": "...", "model": "sr3900p"}`。 |
+| `--test-pattern` | — | 文字の代わりに定規を印刷して、ヘッド帯のうち何ドットがテープに届くかを測る。縦向きのテキストが端から空ける位置に連続線を引き、その外側に 1 ドット 1 本の数えられる線を並べる。`docs/protocol.md` 1.5.1 節。 |
+| `--ignore-print-band` | 無効 | 縦向きのテキストを、端のクリアランスなしでヘッド帯全体に組む。`--test-pattern` で実測したうえで `--top-margin` / `--bottom-margin` と併用する。 |
 | `--printer-status` | — | 印刷せずにプリンタの現在の状態を出して終了する。8 バイトの生ステータス（動作状態バイトとテープインデックス）と、プリンタクラスのポート状態バイト。診断用。 |
 | `--abort` | — | 実行中のジョブを捨てるようプリンタに指示して終了する（プリンタクラスの SOFT_RESET）。送信済みの長いジョブを止める用途。止まった位置でテープは切れずに残る。 |
 | `--no-retry` | 無効 | 一時的なエラーでジョブが捨てられたときに、もう一度送るのをやめる。捨てられたジョブは 1 枚も印刷されないので再送は安全だが、ラベルの途中でエラーになった場合はその分がテープに残る。 |

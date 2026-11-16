@@ -180,6 +180,23 @@ struct Args {
     #[arg(long, value_name = "MODE", conflicts_with_all = ["line_ratios", "max_tape_length_mm"])]
     vertical: Option<VerticalMode>,
 
+    /// Lay sideways text out across the whole head band, without the
+    /// clearance normally kept at each end for dots that may not reach
+    /// the tape. Use with --top-margin / --bottom-margin once you have
+    /// measured your own printer with --test-pattern.
+    #[arg(long)]
+    ignore_print_band: bool,
+
+    /// Print a ruler across the tape instead of text, to find out which
+    /// head dots actually reach it. Two solid lines run the length of
+    /// the label 12 dots in from each end of the head band, with a
+    /// dashed line down the middle; outside each solid line a dash per
+    /// head dot steps away from it, one dash per position along the feed
+    /// so they can be counted. A block at the start of the label marks
+    /// the dot 0 end. TEXT is not used.
+    #[arg(long, conflicts_with_all = ["feed_mm", "labels_file", "vertical"])]
+    test_pattern: bool,
+
     /// Stop whatever the printer is doing and exit: issue the USB
     /// printer-class SOFT_RESET, which the printer takes as "drop this
     /// job". Used to cancel a long multi-label job that has already been
@@ -574,7 +591,7 @@ fn main() -> Result<()> {
 
     let labels: Vec<String> = match &args.labels_file {
         Some(_) if args.feed_mm.is_some() => unreachable!("clap rejects --feed-mm with --labels-file"),
-        _ if args.feed_mm.is_some() => vec![String::new()],
+        _ if args.feed_mm.is_some() || args.test_pattern => vec![String::new()],
         Some(path) => {
             let content = std::fs::read_to_string(path)
                 .with_context(|| format!("failed to read --labels-file {}", path.display()))?;
@@ -717,7 +734,9 @@ fn main() -> Result<()> {
     // expressed as a larger bottom margin (see effective_margins).
     let (top_margin, bottom_margin) = effective_margins(&args, tape)?;
 
-    let rendered: Vec<(Vec<Vec<u8>>, u32)> = match args.feed_mm {
+    let rendered: Vec<(Vec<Vec<u8>>, u32)> = if args.test_pattern {
+        vec![(test_pattern_rows(tape), tape.mm_to_rows(args.left_margin_mm))]
+    } else { match args.feed_mm {
         Some(mm) => {
             if !(1.0..=500.0).contains(&mm) {
                 anyhow::bail!("--feed-mm must be between 1 and 500, got {mm}");
@@ -736,7 +755,37 @@ fn main() -> Result<()> {
             .iter()
             .map(|t| render_label(&renderer, &args, tape, line_ratios.as_deref(), t, top_margin, bottom_margin))
             .collect::<Result<_>>()?,
-    };
+    } };
+    // The outermost dots of the head band may not reach the tape (see
+    // Tape::EDGE_CLEARANCE_DOTS). Ordinary text is kept clear of them by
+    // the font's own metrics, but an explicit --size or --top-margin can
+    // still push ink out there; say so rather than printing a label with
+    // a stroke missing.
+    if !args.test_pattern {
+        let band_lo = TapeWidth::EDGE_CLEARANCE_LOW_DOTS;
+        let band_hi = tape
+            .bitmap_bits()
+            .saturating_sub(TapeWidth::EDGE_CLEARANCE_HIGH_DOTS + 1);
+        let mut outside = None;
+        for (label_rows, _) in &rendered {
+            for row in label_rows {
+                for bit in 0..tape.bitmap_bits() {
+                    if row[bit / 8] >> (7 - (bit % 8)) & 1 == 1 && (bit < band_lo || bit > band_hi) {
+                        outside = Some(bit);
+                    }
+                }
+            }
+        }
+        if let Some(bit) = outside {
+            eprintln!(
+                "warning: ink reaches dot {bit}, outside the {band_lo}..{band_hi} dots measured \
+                 as reaching the tape on {} dots of head; it may not come out (see \
+                 --test-pattern)",
+                tape.bitmap_bits()
+            );
+        }
+    }
+
     let (rows, margin) = (&rendered[0].0, rendered[0].1);
 
     let job_opts = JobOptions { cut: args.cut, copies: args.copies };
@@ -906,6 +955,72 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// A ruler for measuring which head dots actually reach the tape.
+///
+/// Two solid lines run the length of the label, [`REFERENCE_INSET`]
+/// dots in from each end of the head band, and a dashed line runs down
+/// the middle of the band. Outside each solid line, one dash per head
+/// dot steps away from it, each at its own position along the feed: the
+/// dash next to the line is the first dot outside it, the next one the
+/// second, and so on to the edge. Counting the dashes that came out
+/// gives the first and last dot the printer inks, and the dashed centre
+/// line shows how the head sits against the middle of the tape.
+///
+/// A solid block at the start of the label, inside the solid line at
+/// the dot 0 end, tells the two ends apart once the tape is off the
+/// printer and can be held either way up.
+///
+/// Nothing is printed between the lines; the inset is fixed rather than
+/// tied to the clearance the driver keeps, so that there is always room
+/// to count on both sides.
+fn test_pattern_rows(tape: Tape) -> Vec<Vec<u8>> {
+    // Long enough to see without a loupe, with a gap between dashes.
+    const DASH: usize = 32;
+    const STEP: usize = 44;
+    /// How far in from each end of the head band the solid lines sit.
+    const REFERENCE_INSET: usize = 12;
+    let bits = tape.bitmap_bits();
+    let bytes = tape.bitmap_bytes();
+    let inset = REFERENCE_INSET.min(bits / 4);
+    let lo = inset;
+    let hi = bits.saturating_sub(inset + 1);
+    let steps = inset;
+    let total_rows = steps * STEP + 8;
+    let mut rows = vec![vec![0u8; bytes]; total_rows];
+    let set = |rows: &mut Vec<Vec<u8>>, row: usize, bit: usize| {
+        if row < rows.len() && bit < bits {
+            rows[row][bit / 8] |= 1 << (7 - (bit % 8));
+        }
+    };
+    for row in 0..total_rows {
+        set(&mut rows, row, lo);
+        set(&mut rows, row, hi);
+        // The centre of the head band, dashed so it cannot be mistaken
+        // for one of the two solid references.
+        if row % 24 < 12 {
+            set(&mut rows, row, bits / 2);
+        }
+    }
+    for step in 1..=steps {
+        let from = (step - 1) * STEP + 8;
+        for row in from..from + DASH {
+            if let Some(bit) = lo.checked_sub(step) {
+                set(&mut rows, row, bit);
+            }
+            set(&mut rows, row, hi + step);
+        }
+    }
+    // A solid block at the start of the label, just inside the solid
+    // line at the dot 0 end. It tells the two ends apart once the label
+    // is off the printer and the tape can be held either way up.
+    for row in 2..30 {
+        for bit in lo..(lo + 10).min(bits / 2) {
+            set(&mut rows, row, bit);
+        }
+    }
+    rows
+}
+
 /// Renders one label's text with the CLI's layout settings (size,
 /// ratios, wrap length, alignment, margins, frame) into raster rows and
 /// the leading-margin row count.
@@ -993,6 +1108,7 @@ fn render_label(
             top_margin,
             bottom_margin,
             mode,
+            !args.ignore_print_band,
         )?
     } else if let Some(ratios) = line_ratios {
         // With ratios, --size (when given) is the largest-ratio line's

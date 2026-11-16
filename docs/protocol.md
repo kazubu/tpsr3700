@@ -228,6 +228,51 @@ SR750). `--detect-tape` prints that string and the model looked up from
 it (`KNOWN_PRINTERS` in `src/tepra/mod.rs`), and `--model` defaults to
 it.
 
+### 1.5.1 How much of the head band reaches the tape
+
+Not all of it. `--test-pattern` prints a ruler to measure it: two
+solid lines along the label 12 dots in from each end of the head band,
+a dashed line down the middle of the band, and outside each solid line
+one countable dash per dot stepping towards the edge. A solid block at
+the start of the label marks the dot 0 end, so the two ends can be told
+apart once the tape is off the printer. An SR750 with 9mm
+tape was measured twice (2026-11-17), first against lines at dots 9 and
+100 and then against the fixed inset, and gave the same answer both
+times: it inks dots **0..107** of its 112, losing four at the high end
+and none at the low one.
+
+The pattern's centre line showed why. It landed 5.0mm from the dot 0
+edge of the 9mm tape, not 4.5mm, so the 112-dot band (7.90mm at 360
+dpi) runs from 1.05mm to 8.95mm: it sits about half a millimetre
+towards the high end, which puts that end level with the edge of the
+tape, where ink does not take. The low end still has a millimetre of
+tape to spare. The official driver sends the same 112 dots and loses
+them too; its text never reaches that far.
+
+| | dots | mm |
+|---|---:|---:|
+| 9mm tape | 127.5 | 9.00 |
+| head band for 9mm | 112 | 7.90 |
+| what actually inks | 108 | 7.62 |
+
+So this is how one machine holds the tape rather than anything about
+the model, and four dots is a fit at one width, not a rule -- a
+narrower tape has less margin to absorb the same physical offset. The
+driver keeps that measured clearance (nothing at the low end, four dots
+at the high end) for sideways text and refuses a line that then does
+not fit, rather than printing one with its last stroke missing.
+`--test-pattern` measures another machine and `--ignore-print-band`,
+with `--top-margin` / `--bottom-margin`, overrides it.
+
+Only sideways text runs into this. It is as wide across the tape as the
+text is long, where an ordinary label is kept clear of the ends by the
+font metrics -- but if an explicit `--size` or margin does push ink out
+there, it is warned about.
+
+The capture files in `capture-kit` say nothing about this: they are
+ordinary test strings, so the blank space at the ends of their rasters
+is the font, not a printable-area limit.
+
 ### 1.6 Job submission sequence (SR3900P Windows driver)
 
 A USBPcap capture of the SR3900P Windows driver printing one 9mm
