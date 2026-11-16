@@ -487,7 +487,24 @@ fn parse_line_ratios(s: &str) -> Result<Vec<f32>> {
     Ok(out)
 }
 
+/// Rust starts programs with SIGPIPE ignored, so writing to a closed
+/// stdout returns EPIPE and `println!` panics. A command-line tool piped
+/// into `head` should just die quietly instead, which is what the
+/// default disposition does.
+#[cfg(unix)]
+fn restore_sigpipe() {
+    // SAFETY: setting a signal disposition to the system default before
+    // any other thread exists.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
+#[cfg(not(unix))]
+fn restore_sigpipe() {}
+
 fn main() -> Result<()> {
+    restore_sigpipe();
     let args = Args::parse();
 
     // --preview-out never prints, so it behaves like --no-print for the

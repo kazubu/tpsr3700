@@ -215,9 +215,9 @@ rather than just logging:
 3. SOFT_RESET, then bulk-write the payload from the `C` command on.
    The write is split into 32 KiB chunks, a multiple of the endpoint's
    maximum packet size so that only the final chunk is short. The
-   printer accepts bytes only as fast as it prints them, so a long
-   multi-label job cannot be handed over in one transfer; the chunks
-   double as a progress signal.
+   printer accepts bytes only as fast as it prints them once its buffer
+   is full, so a long multi-label job cannot be handed over in one
+   transfer; past that point the chunks double as a progress signal.
 4. Poll `C1 01` until idle again. The job is reported as printed only
    if the printer was seen busy at least once. Without that check a
    dropped job is indistinguishable from a finished one, and the CLI
@@ -232,6 +232,31 @@ roughly 5 s per label, which is where the wait timeout of
 the printer's buffer (100 labels is 838 KB at 9mm, 3.5 MB at 24mm)
 cannot be written in one transfer: the write would have to block for
 the entire print.
+
+A ten-label 9mm job (2026-11-17) put a firmer figure on the buffer: all
+44549 bytes were accepted in 0.24 s, about 50 s before that much tape
+could have been printed. So the buffer holds at least 44 KB, and for
+anything smaller the bytes-sent figure says nothing about how far the
+printing has got -- it is a progress signal only for jobs that outgrow
+the buffer.
+
+### 1.7 Aborting a job in flight
+
+SOFT_RESET also works as "drop the job you are working on", which is
+the only way to stop a multi-label job: by the time anyone decides to
+cancel, tens of kilobytes are already inside the printer and no longer
+under the host's control.
+
+Measured on an SR750 (2026-11-17) with a ten-label 9mm half-cut job,
+all of it accepted in 0.22 s: SOFT_RESET was issued 6 s in, with the
+activity byte at `02`. The printer finished the label it was on,
+reported `05` (cutting) at 10.6 s and was idle at 12.1 s. The whole job
+would have taken about 50 s. So the printer stops at the end of the
+current label rather than mid-label, which leaves a clean cut.
+
+The host cannot send SOFT_RESET while its own job process holds the
+interface, so cancelling means: stop the process that is writing, then
+open the printer again and send SOFT_RESET.
 
 Consequences for this implementation:
 
