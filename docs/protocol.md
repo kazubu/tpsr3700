@@ -260,6 +260,17 @@ them too; its text never reaches that far.
 | head band for 9mm | 112 | 7.90 |
 | what actually inks | 108 | 7.62 |
 
+Sending more dots does not help. With `--dots 127` -- a full 9mm at
+360 dpi -- the printer took the job and printed it, but the pattern
+came out anchored at its dot 0 end: the centre line moved about half a
+millimetre towards the high end, which is what anchoring predicts (the
+middle of 127 dots is dot 63, seven dots further along than dot 56),
+and the high end of the pattern disappeared off the tape along with its
+reference line. The printer does not re-centre a row it is given, so
+the extra dots all land past the edge that was already overhanging, and
+the millimetre of spare tape at the dot 0 end is simply before where
+the head band starts. 112 dots is the whole usable allocation for 9mm.
+
 So this is how one machine holds the tape rather than anything about
 the model, and four dots is a fit at one width, not a rule -- a
 narrower tape has less margin to absorb the same physical offset. The

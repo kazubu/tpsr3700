@@ -284,11 +284,25 @@ pub enum DotsSource {
 pub struct Tape {
     pub model: Model,
     pub width: TapeWidth,
+    /// Dots per raster row, when something other than the captured
+    /// figure for this (model, width) is wanted. Experimental, and the
+    /// experiment it was written for came back negative: the printer
+    /// anchors a row at its dot 0 end rather than centring it, so extra
+    /// dots only extend past the far edge of the tape (see
+    /// `docs/protocol.md` section 1.5.1). The job header still names the
+    /// real tape width.
+    dots_override: Option<u16>,
 }
 
 impl Tape {
     pub fn new(model: Model, width: TapeWidth) -> Self {
-        Self { model, width }
+        Self { model, width, dots_override: None }
+    }
+
+    /// The same tape with a different number of dots per row, to find
+    /// out what the printer does with it. See [`Self::dots_override`].
+    pub fn with_dots(self, dots: u16) -> Self {
+        Self { dots_override: Some(dots), ..self }
     }
 
     /// Shorthand for tests and SR3700P-only callers.
@@ -349,7 +363,7 @@ impl Tape {
 
     /// Number of print head dots used (see [`Self::dots_with_source`]).
     pub fn dots(self) -> u16 {
-        self.dots_with_source().0
+        self.dots_override.unwrap_or_else(|| self.dots_with_source().0)
     }
 
     /// Whether [`Self::dots`] is backed by a capture of this model's

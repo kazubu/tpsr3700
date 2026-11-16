@@ -88,6 +88,7 @@ tpsr3700 [OPTIONS] <TEXT>
 | `--printer-status` | — | Print the printer's current state and exit, without printing: the raw 8-byte vendor status (activity byte and tape index) and the printer-class port status byte. Diagnostic only. |
 | `--abort` | — | Tell the printer to drop the job it is working on (printer-class SOFT_RESET) and exit. Used to cancel a long multi-label job that is already on its way; the tape is left uncut where it stopped. |
 | `--no-retry` | off | Do not send the job again when the printer drops it with a transient fault. The retry is safe because a dropped job prints nothing, but a fault raised part way through a label would leave that part on the tape. |
+| `--dots <N>` | per width | Send this many dots per raster row instead of the captured figure. Experimental: the printer anchors a row at its dot 0 end, so more dots only run off the far edge (`docs/protocol.md` §1.5.1). |
 | `--no-status-check` | off | Print even when the printer reports a fault in its status (bytes 2 and 5, see `docs/protocol.md` §1.5). Those bits are how a dropped job is told apart from a printed one, so this is a last resort. |
 | `--no-tape-check` | off | Print even when the loaded tape is not the width given by `--tape-mm`. By default a mismatch, or no tape at all, is refused before the job is sent. Cable-marking tape reports the same width as plain tape, so that pair is not distinguished. |
 | `--line-ratios <R,R>` | — | Per-line font size ratios for multi-line text (e.g. `7,3`). The count must equal the number of lines. See [Multi-line rules](#multi-line-rules). |
@@ -302,6 +303,7 @@ tpsr3700 [オプション] <テキスト>
 | `--printer-status` | — | 印刷せずにプリンタの現在の状態を出して終了する。8 バイトの生ステータス（動作状態バイトとテープインデックス）と、プリンタクラスのポート状態バイト。診断用。 |
 | `--abort` | — | 実行中のジョブを捨てるようプリンタに指示して終了する（プリンタクラスの SOFT_RESET）。送信済みの長いジョブを止める用途。止まった位置でテープは切れずに残る。 |
 | `--no-retry` | 無効 | 一時的なエラーでジョブが捨てられたときに、もう一度送るのをやめる。捨てられたジョブは 1 枚も印刷されないので再送は安全だが、ラベルの途中でエラーになった場合はその分がテープに残る。 |
+| `--dots <N>` | 幅ごとの既定 | 1 行あたりのドット数を、キャプチャ由来の値でなくこの値にする。実験用: プリンタは行をドット 0 側で固定するので、増やしても反対側のテープ外に伸びるだけ (`docs/protocol.md` 1.5.1 節)。 |
 | `--no-status-check` | 無効 | プリンタが状態バイトでエラーを報告していても印刷する（バイト 2 と 5。`docs/protocol.md` 1.5 節）。捨てられたジョブと印刷されたジョブを区別しているのがこのビットなので、最後の手段。 |
 | `--no-tape-check` | 無効 | `--tape-mm` と装着テープが違っても印刷する。既定では、幅が違う場合とテープが入っていない場合を、ジョブを送る前にエラーにする。ケーブル表示テープは同じ幅の通常テープと同じ値を返すため、その組み合わせは判別できない。 |
 | `--line-ratios <R,R>` | — | 複数行テキストの行ごとの文字サイズ比率（例: `7,3`）。個数は行数と一致する必要がある。[複数行印刷のルール](#複数行印刷のルール)を参照。 |

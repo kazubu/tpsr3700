@@ -187,6 +187,14 @@ struct Args {
     #[arg(long)]
     ignore_print_band: bool,
 
+    /// Send this many dots per raster row instead of the number the
+    /// official driver uses for the tape width. Experimental: the head
+    /// is much wider than a narrow tape, so there may be room the
+    /// official driver does not use, but the job header still names the
+    /// real width and the printer may simply drop the job.
+    #[arg(long, value_name = "N")]
+    dots: Option<u16>,
+
     /// Print a ruler across the tape instead of text, to find out which
     /// head dots actually reach it. Two solid lines run the length of
     /// the label 12 dots in from each end of the head band, with a
@@ -700,7 +708,18 @@ fn main() -> Result<()> {
         }
     }
 
-    let tape = width.on(model);
+    let tape = match args.dots {
+        Some(dots) => {
+            let tape = width.on(model).with_dots(dots);
+            eprintln!(
+                "experiment: sending {dots} dots per row instead of the usual {} for {}mm",
+                width.on(model).dots(),
+                tape.width_mm()
+            );
+            tape
+        }
+        None => width.on(model),
+    };
     if tape.dots_source() == DotsSource::Extrapolated {
         eprintln!(
             "warning: {}mm tape on the {} has not been captured from the official driver; \
