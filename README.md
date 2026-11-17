@@ -68,7 +68,7 @@ tpsr3700 [OPTIONS] <TEXT>
 | `--copies <N>` | `1` | Print N identical labels in one job, cut apart per `--cut`. |
 | `--labels-file <PATH>` | — | Print several different labels as one job: the file holds the labels separated by ASCII RS (0x1E). Replaces TEXT. Each label gets `--copies` copies; `--cut` applies between all of them. |
 | `--feed-mm <MM>` | — | Feed that much blank tape instead of printing, then cut per `--cut`. A full/half cut also ejects the fixed head-to-cutter lead (~9mm on an SR750) as a separate leading scrap, so feed-and-cut yields that scrap plus the fed piece; feed without a cut to avoid the scrap. Replaces TEXT. |
-| `--size <PT>` | auto | Font size in points (as shown in the TEPRA app, e.g. `36`). Omit for the largest size that fits. |
+| `--size <PT>` | auto | Font size in points (as shown in the TEPRA app, e.g. `36`). Omit to size by what the font actually prints: the reference character 国 is measured and scaled to fill 90% of the printable band, so the same "auto" looks the same in any font. |
 | `--left-margin-mm <MM>` | `4.0` | Blank feed margin (mm) added before the printed content (left side as the label exits the printer). 1mm more than the right by default because the SR3900P trims the leading edge slightly. |
 | `--right-margin-mm <MM>` | `3.0` | Blank feed margin (mm) added after the printed content (right side). |
 | `--top-margin <DOTS>` | `2` | Non-printing margin at the top edge of the tape, in dots. |
@@ -283,7 +283,7 @@ tpsr3700 [オプション] <テキスト>
 | `--copies <N>` | `1` | 同じラベルを 1 ジョブで N 枚印刷（`--cut` の設定で切り分け）。 |
 | `--labels-file <PATH>` | — | 内容の異なる複数ラベルを 1 ジョブで印刷。ファイル内のラベルは ASCII RS (0x1E) 区切り。TEXT の代わりに指定。各ラベルに `--copies`、ラベル間に `--cut` が効く。 |
 | `--feed-mm <MM>` | — | 印刷せずに指定長の空白テープを送って `--cut` でカット。フル／ハーフカットではヘッド〜カッター間（SR750 で約 9mm）が先頭の切れ端として別に排出されるため、送ってカットすると切れ端＋指定長の 2 枚になる。切れ端を出したくなければカットなしで送る。TEXT の代わりに指定。 |
-| `--size <PT>` | 自動 | フォントサイズ（ポイント、TEPRA アプリの表示と同じ。例: `36`）。省略時はテープに収まる最大サイズ。 |
+| `--size <PT>` | 自動 | フォントサイズ（ポイント、TEPRA アプリの表示と同じ。例: `36`）。省略時は実際に印字される大きさで決める: 基準字「国」の字面を測り、印字可能帯の 90% になるよう拡大する。どのフォントでも同じ見た目の大きさになる。 |
 | `--left-margin-mm <MM>` | `4.0` | 印字内容の前（ラベルがプリンターから出る側＝左端）に追加する余白（mm）。SR3900P は先端側が少し短く出るため、既定で右より 1mm 大きい。 |
 | `--right-margin-mm <MM>` | `3.0` | 印字内容の後（右端）に追加する余白（mm）。 |
 | `--top-margin <DOTS>` | `2` | テープ上端の非印字マージン（ドット数）。 |

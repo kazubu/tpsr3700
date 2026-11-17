@@ -177,18 +177,66 @@ impl FontRenderer {
     /// `top_margin_bits` / `bottom_margin_bits` are the number of non-printing
     /// dots at the respective tape edge (default: [`TapeWidth::HEAD_MARGIN_BITS`]
     /// each).
+    /// Reference character for sizing: a full-width ideograph fills the
+    /// em box in any Japanese font, so its ink is a fair stand-in for
+    /// "how big does this font actually print".
+    const SIZE_REFERENCE: char = '\u{56fd}';
+
+    /// What fraction of the printable band the reference character's ink
+    /// is aimed at. Measured from the bundled BIZ UDPGothic, which has
+    /// always landed on 89-90% across every tape width, so the bundled
+    /// font keeps the size it has always had.
+    const SIZE_TARGET: f32 = 0.90;
+
+    /// Ink height of the reference character at `size_px`, in pixels.
+    fn reference_ink_px(&self, size_px: f32) -> Option<f32> {
+        let (metrics, bitmap) = self.font.rasterize(Self::SIZE_REFERENCE, size_px);
+        if metrics.width == 0 || metrics.height == 0 || bitmap.iter().all(|&c| c <= 127) {
+            return None;
+        }
+        let mut top = None;
+        let mut bottom = 0;
+        for gy in 0..metrics.height {
+            if (0..metrics.width).any(|gx| bitmap[gy * metrics.width + gx] > 127) {
+                top.get_or_insert(gy);
+                bottom = gy;
+            }
+        }
+        top.map(|t| (bottom - t + 1) as f32)
+    }
+
     pub fn max_size_pt_for_tape(
         &self,
         tape: Tape,
         top_margin_bits: usize,
         bottom_margin_bits: usize,
     ) -> f32 {
-        let ratio_per_px = self.line_height_px(1.0);
         let head_bits = tape
             .bitmap_bits()
             .saturating_sub(top_margin_bits + bottom_margin_bits)
             .max(1);
-        let max_px = head_bits as f32 / ratio_per_px;
+        // Size by what the font actually prints rather than by the line
+        // height it declares: those differ by a factor of 1.5 between
+        // fonts, which is why the same "auto" produced glyphs filling 90%
+        // of the tape in one font and 60% in another.
+        let target = head_bits as f32 * Self::SIZE_TARGET;
+        let probe_px = 64.0;
+        if let Some(ink) = self.reference_ink_px(probe_px) {
+            if ink > 0.0 {
+                // One refinement: rounding and hinting make the ink
+                // height not quite linear in the size.
+                let mut px = probe_px * target / ink;
+                if let Some(ink2) = self.reference_ink_px(px) {
+                    if ink2 > 0.0 {
+                        px *= target / ink2;
+                    }
+                }
+                return px_to_pt(px, tape.model);
+            }
+        }
+        // No reference glyph (a Latin-only font): fall back to the line
+        // height, as before.
+        let max_px = head_bits as f32 / self.line_height_px(1.0);
         px_to_pt(max_px, tape.model)
     }
 
@@ -672,6 +720,30 @@ impl FontRenderer {
             None => size_px,
         };
 
+        // Where the string's ink sits inside the line box, so it can be
+        // centred in the band instead of hanging from the line box top.
+        // A font whose declared line height is taller than the band would
+        // otherwise push the glyphs off the bottom edge and lose them --
+        // which is what used to cap the automatic size. The multi-line
+        // paths already centre this way.
+        let mut ink_top = f32::MAX;
+        let mut ink_bottom = f32::MIN;
+        for ch in text.chars() {
+            let metrics = self.font.metrics(ch, size_px);
+            if metrics.width == 0 || metrics.height == 0 {
+                continue;
+            }
+            let glyph_top = ascent - (metrics.ymin as f32 + metrics.height as f32);
+            ink_top = ink_top.min(glyph_top);
+            ink_bottom = ink_bottom.max(glyph_top + metrics.height as f32);
+        }
+        let centring = if ink_top <= ink_bottom {
+            let ink_h = ink_bottom - ink_top;
+            (head_bits as f32 - ink_h) / 2.0 - ink_top
+        } else {
+            0.0
+        };
+
         let mut cursor_x = 0.0f32;
         for ch in text.chars() {
             let (metrics, bitmap) = self.font.rasterize(ch, size_px);
@@ -692,7 +764,7 @@ impl FontRenderer {
                         // at `ascent - (ymin + height)` relative to the
                         // baseline. Convert to a row within the printable area.
                         let glyph_top = ascent - (metrics.ymin as f32 + glyph_height as f32);
-                        let row = (glyph_top + gy as f32).round() as isize;
+                        let row = (glyph_top + centring + gy as f32).round() as isize;
                         // Clip to printable area.
                         if row < 0 || row as usize >= head_bits {
                             continue;
@@ -1575,14 +1647,43 @@ mod tests {
     }
 
     #[test]
-    fn max_size_does_not_clip() {
+    fn max_size_fills_the_band_without_clipping() {
         let renderer = default_renderer();
         for tape in TapeWidth::ALL.map(Tape::sr3700p) {
-            let max = renderer.max_size_pt_for_tape(tape, TapeWidth::HEAD_MARGIN_BITS, TapeWidth::HEAD_MARGIN_BITS);
-            assert!(!renderer.would_clip(max, tape, TapeWidth::HEAD_MARGIN_BITS, TapeWidth::HEAD_MARGIN_BITS));
-            // A couple of points larger should clip.
-            assert!(renderer.would_clip(max + 2.0, tape, TapeWidth::HEAD_MARGIN_BITS, TapeWidth::HEAD_MARGIN_BITS));
+            let margin = TapeWidth::HEAD_MARGIN_BITS;
+            let band = tape.bitmap_bits() - 2 * margin;
+            let max = renderer.max_size_pt_for_tape(tape, margin, margin);
+            let (rows, _) = renderer
+                .render_text("国", max, tape, 0.0, 0.0, margin, margin)
+                .unwrap();
+            let (lo, hi) = ink_bits(&rows, tape.bitmap_bits()).expect("the reference character prints");
+            // Sized by the ink rather than by the declared line height, so
+            // it fills most of the band whatever the font says about its
+            // own metrics -- and still fits inside it.
+            let ink = hi - lo + 1;
+            assert!(
+                ink * 100 >= band * 80 && ink <= band,
+                "{}mm: ink {ink} of a {band} dot band",
+                tape.width_mm()
+            );
+            assert!(lo >= margin && hi < tape.bitmap_bits() - margin, "{}mm: ink {lo}..{hi} left the band", tape.width_mm());
         }
+    }
+
+    /// First and last inked bit across all rows.
+    fn ink_bits(rows: &[Vec<u8>], total_bits: usize) -> Option<(usize, usize)> {
+        let mut lo = None;
+        let mut hi = 0;
+        for row in rows {
+            for bit in 0..total_bits {
+                if row_bit_is_set(row, bit) {
+                    lo.get_or_insert(bit);
+                    lo = Some(lo.unwrap().min(bit));
+                    hi = hi.max(bit);
+                }
+            }
+        }
+        lo.map(|l| (l, hi))
     }
 
     #[test]
@@ -1679,6 +1780,14 @@ mod tests {
         let head_offset = bottom_margin_bits;
         let head_bits = total_bits.saturating_sub(top_margin_bits + bottom_margin_bits);
         let actual = rows_to_ascii(rows, total_bits, head_offset, head_bits, max_cols);
+        if std::env::var("DUMP_ASCII_ART").is_ok() && actual != expected {
+            // Regenerating a golden: print the literal to paste back in.
+            for line in actual.split('\n') {
+                println!("{line}\\n\\");
+            }
+            println!("<<<END>>>");
+            return;
+        }
         assert_eq!(
             actual, expected,
             "\nASCII art mismatch.\nExpected:\n{expected}\nActual:\n{actual}"
@@ -2367,48 +2476,48 @@ mod tests {
 ........|.......................................|.......\n\
 ........|.......................................|.......\n\
 ........|..################.....................|.......\n\
-........|..################....################.|.......\n\
-........|.........##.....##....################.|.......\n\
+........|..################...#################.|.......\n\
+........|.........##.....##...#################.|.......\n\
+........|.........##.....##...##.............##.|.......\n\
+........|.........##.....##...##.............##.|.......\n\
+........|.........##.....##...##.............##.|.......\n\
 ........|.........##.....##....#.............##.|.......\n\
 ........|.........##.....##....#.............##.|.......\n\
-........|.........##.....##....#.............##.|.......\n\
-........|.........##.....##....#.............##.|.......\n\
-........|.........##.....##....#.............##.|.......\n\
-........|.........##.....##....##............#..|.......\n\
-........|................##....##...........##..|.......\n\
-........|......................###..........##..|.......\n\
-........|.......................###........##...|.......\n\
-........|........................####...####....|.......\n\
+........|.........##.....##....##............##.|.......\n\
+........|................##....##............#..|.......\n\
+........|......................##...........##..|.......\n\
+........|.......................##.........##...|.......\n\
+........|........................###.....####...|.......\n\
 ........|.........................#########.....|.......\n\
-........|#############...............###........|.......\n\
+........|#############..............#####.......|.......\n\
 ........|#############..........................|.......\n\
 ........|...##......#...........................|.......\n\
 ........|...#........#..........................|.......\n\
-........|..##........#.......#############......|.......\n\
+........|..##........##......#############......|.......\n\
 ........|..##........##......#############......|.......\n\
 ........|..##........##.........##......#.......|.......\n\
 ........|..##........#..........#........#......|.......\n\
-........|...##......##.........##........#......|.......\n\
+........|...##......##.........##........##.....|.......\n\
 ........|...#########..........##........##.....|.......\n\
 ........|.....######...........##........##.....|.......\n\
 ........|......................##........#......|.......\n\
 ........|.......................##......##......|.......\n\
 ........|.......................#########.......|.......\n\
-........|.##################......######........|.......\n\
-........|..################.....................|.......\n\
+........|.........................######........|.......\n\
+........|.##################....................|.......\n\
+........|..#################....................|.......\n\
 ........|..##.......#...........................|.......\n\
-........|..#........##..........................|.......\n\
-........|.##.........#........##################|.......\n\
-........|.##.........##........################.|.......\n\
+........|..#.........#........##################|.......\n\
+........|.##.........##........#################|.......\n\
 ........|.##.........##........##.......#.......|.......\n\
-........|.##........##.........#........##......|.......\n\
-........|..##......###........##.........#......|.......\n\
+........|.##.........##........#.........#......|.......\n\
+........|.##........##........##.........##.....|.......\n\
+........|..##......###........##.........##.....|.......\n\
 ........|...#########.........##.........##.....|.......\n\
-........|....######...........##.........##.....|.......\n\
-........|.....................##........##......|.......\n\
+........|....#######..........##........##......|.......\n\
 ........|......................##......###......|.......\n\
 ........|.......................#########.......|.......\n\
-........|........................######.........|.......\n\
+........|........................#######........|.......\n\
 ........|.......................................|.......\n\
 ........|.......................................|.......\n\
 ........|.......................................|.......\n\
@@ -2526,33 +2635,33 @@ mod tests {
 |...##............##.............###......###.........|.\n\
 |...##...........###............###........##.........|.\n\
 |...###..........##.............##..........##........|.\n\
-|....##.........###............##...........##........|.\n\
+|...###.........###............##...........##........|.\n\
 |....####......####............##............##.......|.\n\
 |.....############.............##............##.......|.\n\
 |......##########..............##...........###.......|.\n\
 |........#####.................###..........##........|.\n\
-|...............................##.........###........|.\n\
+|..............................###.........###........|.\n\
 |...............................####......####........|.\n\
 |................................############.........|.\n\
 |.................................##########..........|.\n\
 |..#######################..........#####.............|.\n\
-|...######################............................|.\n\
+|..#######################............................|.\n\
 |....##........##.....................................|.\n\
 |...##..........##....................................|.\n\
 |...##...........##...................................|.\n\
 |..##............##...........#######################.|.\n\
-|..##.............##...........######################.|.\n\
+|..##.............##..........#######################.|.\n\
 |..##.............##............##........##..........|.\n\
 |..##............###...........##..........##.........|.\n\
 |..###...........##............##...........##........|.\n\
 |...##..........###...........##............##........|.\n\
-|...####......####............##.............##.......|.\n\
-|....############.............##.............##.......|.\n\
+|...####.......###............##.............##.......|.\n\
+|....#############............##.............##.......|.\n\
 |.....##########..............##............###.......|.\n\
 |........#####................###...........##........|.\n\
 |..............................##..........###........|.\n\
-|..............................####......####.........|.\n\
-|...............................############..........|.\n\
+|..............................####.......###.........|.\n\
+|...............................#############.........|.\n\
 |................................##########...........|.\n\
 |...................................#####.............|.\n\
 |.....................................................|.\n\
