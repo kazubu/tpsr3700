@@ -77,6 +77,7 @@ tpsr3700 [OPTIONS] <TEXT>
 | `--vertical <MODE>` | off | Lay the label out sideways, for tape applied vertically. `stacked` puts one character after another along the tape, each turned a quarter turn so it stands upright (縦書き proper; the long vowel mark, dashes and brackets are turned with it). A newline starts a new column, placed to the left of the one before it as vertical writing expects, and the columns share the tape width. `rotated` turns the whole label a quarter turn, so a line runs across the tape and the next line follows along the feed. The tape width limits a character in `stacked` and a whole line in `rotated`; anything longer is an error. Not combinable with `--line-ratios` or `--max-tape-length-mm`. |
 | `--align <ALIGN>` | `left` | Per-line alignment: `left`, `center`, or `right`. Within the label length with `--max-tape-length-mm`, otherwise within the widest line of a multi-line text (no effect on single-line text). |
 | `--font <PATH>` | bundled BIZ UDPゴシック | Path to a `.ttf`/`.otf`/`.ttc` font file. Overrides the bundled font. |
+| `--font-index <N>` | `0` | Which face to take from `--font`. A `.ttc` holds several: Noto Sans CJK ships ten in one file, the per-language and monospaced cuts among them. |
 | `--dump <PATH>` | — | Write the raw job bytes to a file (in addition to, or instead of, printing). |
 | `--no-print` | — | Skip sending the job to the printer. Useful with `--dump`. |
 | `--skip-preview` | — | Skip the SVG print preview and print immediately. A preview is shown by default (requires the `preview` build feature, enabled by default). |
@@ -292,6 +293,7 @@ tpsr3700 [オプション] <テキスト>
 | `--vertical <MODE>` | 無効 | テープを縦に貼る向きでラベルを組む。`stacked` は 1 文字ずつテープに沿って並べ、各文字を 90° 回して正立させる（本来の縦書き。長音符・ダッシュ・括弧も一緒に回す）。改行すると列が変わり、縦書きの作法どおり前の列の左側に置く。列はテープ幅を分け合う。`rotated` はラベル全体を 90° 回し、行がテープ幅方向に伸びて次の行が送り方向に続く。テープ幅が、`stacked` では 1 文字の、`rotated` では 1 行の長さの上限になり、超えるとエラー。`--line-ratios` / `--max-tape-length-mm` とは併用不可。 |
 | `--align <ALIGN>` | `left` | 各行の横方向揃え: `left`（左寄せ）・`center`（中央）・`right`（右寄せ）。`--max-tape-length-mm` 指定時はラベル長の中で、未指定時は複数行の最長行の中で揃える（1 行のみの場合は効果なし）。 |
 | `--font <PATH>` | バンドル済み BIZ UDPゴシック | フォントファイルのパス（`.ttf`/`.otf`/`.ttc`）。バンドルフォントを上書きします。 |
+| `--font-index <N>` | `0` | `--font` のどの書体を使うか。`.ttc` は複数の書体を持つ（Noto Sans CJK は言語別・等幅を含めて 10 面）。 |
 | `--dump <PATH>` | — | 生のジョブバイト列をファイルに書き出す（印刷と併用可）。 |
 | `--no-print` | — | プリンターへの送信をスキップ。`--dump` と組み合わせて使用。 |
 | `--skip-preview` | — | SVG 印刷プレビューを表示せず、すぐに印刷する。デフォルトではプレビューを表示する（`preview` ビルドフィーチャーが必要。デフォルトで有効）。 |

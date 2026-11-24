@@ -146,15 +146,32 @@ impl FontRenderer {
     /// Load a font from a file path (`.ttf`, `.otf`, or `.ttc`; for `.ttc`
     /// collections, the first face is used).
     pub fn load(path: &str) -> Result<Self> {
+        Self::load_face(path, 0)
+    }
+
+    /// Loads one face out of a font file. A `.ttc` holds several -- Noto
+    /// Sans CJK ships ten in one file, Japanese and Korean and the
+    /// monospaced cuts among them -- and `index` picks which.
+    pub fn load_face(path: &str, index: u32) -> Result<Self> {
         let data = std::fs::read(path)
             .with_context(|| format!("failed to read font file: {path}"))?;
-        Self::from_bytes(&data).map_err(|e| anyhow::anyhow!("failed to parse font {path}: {e}"))
+        Self::from_bytes_face(&data, index)
+            .map_err(|e| anyhow::anyhow!("failed to parse font {path} face {index}: {e}"))
     }
 
     /// Parse a font directly from raw bytes (`.ttf`, `.otf`, or `.ttc`).
     /// Useful for embedding fonts via `include_bytes!` without filesystem access.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        let font = fontdue::Font::from_bytes(data, fontdue::FontSettings::default())
+        Self::from_bytes_face(data, 0)
+    }
+
+    /// As [`Self::from_bytes`], for one face of a collection.
+    pub fn from_bytes_face(data: &[u8], index: u32) -> Result<Self> {
+        let settings = fontdue::FontSettings {
+            collection_index: index,
+            ..fontdue::FontSettings::default()
+        };
+        let font = fontdue::Font::from_bytes(data, settings)
             .map_err(|e| anyhow::anyhow!("failed to parse font from bytes: {e}"))?;
         Ok(Self { font })
     }

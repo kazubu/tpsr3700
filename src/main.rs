@@ -355,6 +355,12 @@ struct Args {
     #[arg(long)]
     font: Option<String>,
 
+    /// Which face to take from --font. A .ttc holds several (Noto Sans
+    /// CJK ships ten, including the monospaced and the per-language
+    /// cuts); a plain .ttf or .otf holds one, so this stays 0 for them.
+    #[arg(long, default_value_t = 0, requires = "font")]
+    font_index: u32,
+
     /// Draw a rectangular frame around the printed content. The frame
     /// is applied to the rendered raster rows (see
     /// `font::apply_frame`), so it composes with multi-line text,
@@ -734,7 +740,7 @@ fn main() -> Result<()> {
     }
 
     let renderer = match &args.font {
-        Some(path) => FontRenderer::load(path)?,
+        Some(path) => FontRenderer::load_face(path, args.font_index)?,
         None => FontRenderer::from_bytes(DEFAULT_FONT_BYTES)
             .map_err(|e| anyhow::anyhow!("bundled font failed to load: {e}"))?,
     };
